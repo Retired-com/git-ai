@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use git_ai::authorship::authorship_log_serialization::AuthorshipLog;
 use git_ai::authorship::stats::CommitStats;
 use git_ai::config::ConfigPatch;
@@ -16,12 +18,60 @@ use std::time::Duration;
 
 use super::test_file::TestFile;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitTestMode {
+    Wrapper,
+    Hooks,
+    Both,
+}
+
+impl GitTestMode {
+    fn from_env() -> Self {
+        let mode = std::env::var("GIT_AI_TEST_GIT_MODE")
+            .unwrap_or_else(|_| "wrapper".to_string())
+            .to_lowercase();
+        match mode.as_str() {
+            "hooks" => Self::Hooks,
+            "both" | "wrapper+hooks" | "hooks+wrapper" => Self::Both,
+            _ => Self::Wrapper,
+        }
+    }
+
+    fn uses_wrapper(self) -> bool {
+        matches!(self, Self::Wrapper | Self::Both)
+    }
+
+    fn uses_hooks(self) -> bool {
+        matches!(self, Self::Hooks | Self::Both)
+    }
+}
+
+#[cfg(unix)]
+fn create_file_symlink(target: &PathBuf, link: &PathBuf) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_file_symlink(target: &PathBuf, link: &PathBuf) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+        .or_else(|_| std::fs::copy(target, link).map(|_| ()))
+}
+
 #[derive(Clone, Debug)]
 pub struct TestRepo {
     path: PathBuf,
     pub feature_flags: FeatureFlags,
     pub(crate) config_patch: Option<ConfigPatch>,
     test_db_path: PathBuf,
+    test_home: PathBuf,
+    git_mode: GitTestMode,
+}
+
+#[allow(dead_code)]
+impl Default for TestRepo {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TestRepo {
@@ -39,6 +89,8 @@ impl TestRepo {
         let path = base.join(n.to_string());
         // Create DB path as sibling to repo (not inside) to avoid git conflicts with WAL files
         let test_db_path = base.join(format!("{}-db", n));
+        let test_home = base.join(format!("{}-home", n));
+        let git_mode = GitTestMode::from_env();
         let repo = Repository::init(&path).expect("failed to initialize git2 repository");
         let mut config = Repository::config(&repo).expect("failed to initialize git2 repository");
         config
@@ -53,9 +105,16 @@ impl TestRepo {
             feature_flags: FeatureFlags::default(),
             config_patch: None,
             test_db_path,
+            test_home,
+            git_mode,
         };
 
+        // Ensure the default branch is named "main" for consistency across Git versions
+        // This is important because Git 2.28+ defaults to "main" while older versions use "master"
+        let _ = repo.git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+
         repo.apply_default_config_patch();
+        repo.setup_git_hooks_mode();
 
         repo
     }
@@ -67,15 +126,22 @@ impl TestRepo {
         let base = std::env::temp_dir();
         let path = base.join(n.to_string());
         let test_db_path = base.join(format!("{}-db", n));
+        let test_home = base.join(format!("{}-home", n));
+        let git_mode = GitTestMode::from_env();
 
         Repository::init_bare(&path).expect("failed to init bare repository");
 
-        Self {
+        let repo = Self {
             path,
             feature_flags: FeatureFlags::default(),
             config_patch: None,
             test_db_path,
-        }
+            test_home,
+            git_mode,
+        };
+
+        repo.setup_git_hooks_mode();
+        repo
     }
 
     /// Create a pair of test repos: a local mirror and its upstream remote.
@@ -102,6 +168,8 @@ impl TestRepo {
         let upstream_path = base.join(upstream_n.to_string());
         // Create DB path as sibling to repo (not inside) to avoid git conflicts with WAL files
         let upstream_test_db_path = base.join(format!("{}-db", upstream_n));
+        let upstream_test_home = base.join(format!("{}-home", upstream_n));
+        let git_mode = GitTestMode::from_env();
         Repository::init_bare(&upstream_path).expect("failed to init bare upstream repository");
 
         let mut upstream = Self {
@@ -109,13 +177,19 @@ impl TestRepo {
             feature_flags: FeatureFlags::default(),
             config_patch: None,
             test_db_path: upstream_test_db_path,
+            test_home: upstream_test_home,
+            git_mode,
         };
+
+        // Ensure the upstream default branch is named "main" for consistency across Git versions
+        let _ = upstream.git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
 
         // Clone upstream to create mirror with origin configured
         let mirror_n: u64 = rng.gen_range(0..10000000000);
         let mirror_path = base.join(mirror_n.to_string());
         // Create DB path as sibling to repo (not inside) to avoid git conflicts with WAL files
         let mirror_test_db_path = base.join(format!("{}-db", mirror_n));
+        let mirror_test_home = base.join(format!("{}-home", mirror_n));
 
         let clone_output = Command::new("git")
             .args([
@@ -150,10 +224,17 @@ impl TestRepo {
             feature_flags: FeatureFlags::default(),
             config_patch: None,
             test_db_path: mirror_test_db_path,
+            test_home: mirror_test_home,
+            git_mode,
         };
+
+        // Ensure the default branch is named "main" for consistency across Git versions
+        let _ = mirror.git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
 
         upstream.apply_default_config_patch();
         mirror.apply_default_config_patch();
+        upstream.setup_git_hooks_mode();
+        mirror.setup_git_hooks_mode();
 
         (mirror, upstream)
     }
@@ -163,6 +244,8 @@ impl TestRepo {
         let mut rng = rand::thread_rng();
         let db_n: u64 = rng.gen_range(0..10000000000);
         let test_db_path = std::env::temp_dir().join(format!("{}-db", db_n));
+        let test_home = std::env::temp_dir().join(format!("{}-home", db_n));
+        let git_mode = GitTestMode::from_env();
         let repo = Repository::init(path).expect("failed to initialize git2 repository");
         let mut config = Repository::config(&repo).expect("failed to initialize git2 repository");
         config
@@ -176,13 +259,65 @@ impl TestRepo {
             feature_flags: FeatureFlags::default(),
             config_patch: None,
             test_db_path,
+            test_home,
+            git_mode,
         };
+
+        // Ensure the default branch is named "main" for consistency across Git versions
+        let _ = repo.git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+
         repo.apply_default_config_patch();
+        repo.setup_git_hooks_mode();
         repo
     }
 
     pub fn set_feature_flags(&mut self, feature_flags: FeatureFlags) {
         self.feature_flags = feature_flags;
+    }
+
+    fn setup_git_hooks_mode(&self) {
+        if !self.git_mode.uses_hooks() {
+            return;
+        }
+
+        let binary_path = get_binary_path();
+        let mut command = Command::new(binary_path);
+        command
+            .current_dir(&self.path)
+            .args(["git-hooks", "ensure"]);
+        self.configure_git_ai_env(&mut command);
+        command.env("GIT_AI_TEST_DB_PATH", self.test_db_path.to_str().unwrap());
+
+        let output = command
+            .output()
+            .expect("failed to run git-ai git-hooks ensure in test setup");
+        if !output.status.success() {
+            panic!(
+                "git-ai git-hooks ensure failed during test setup:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
+
+    fn configure_command_env(&self, command: &mut Command) {
+        if self.git_mode.uses_hooks() {
+            command.env("HOME", &self.test_home);
+            command.env("GIT_CONFIG_GLOBAL", self.test_home.join(".gitconfig"));
+            command.env("GIT_AI_GLOBAL_GIT_HOOKS", "true");
+        }
+
+        if self.git_mode.uses_wrapper() {
+            command.env("GIT_AI", "git");
+        }
+    }
+
+    fn configure_git_ai_env(&self, command: &mut Command) {
+        if self.git_mode.uses_hooks() {
+            command.env("HOME", &self.test_home);
+            command.env("GIT_CONFIG_GLOBAL", self.test_home.join(".gitconfig"));
+            command.env("GIT_AI_GLOBAL_GIT_HOOKS", "true");
+        }
     }
 
     /// Patch the git-ai config for this test repo
@@ -220,6 +355,10 @@ impl TestRepo {
         &self.test_db_path
     }
 
+    pub fn test_home_path(&self) -> &PathBuf {
+        &self.test_home
+    }
+
     pub fn stats(&self) -> Result<CommitStats, String> {
         let mut stats = self.git_ai(&["stats", "--json"]).unwrap();
         stats = stats.split("}}}").next().unwrap().to_string() + "}}}";
@@ -235,11 +374,11 @@ impl TestRepo {
     }
 
     pub fn git_ai(&self, args: &[&str]) -> Result<String, String> {
-        return self.git_ai_with_env(args, &[]);
+        self.git_ai_with_env(args, &[])
     }
 
     pub fn git(&self, args: &[&str]) -> Result<String, String> {
-        return self.git_with_env(args, &[], None);
+        self.git_with_env(args, &[], None)
     }
 
     /// Run a git command from a working directory (without using -C flag)
@@ -254,8 +393,15 @@ impl TestRepo {
     }
 
     pub fn git_og(&self, args: &[&str]) -> Result<String, String> {
+        #[cfg(windows)]
+        let null_hooks = "NUL";
+        #[cfg(not(windows))]
+        let null_hooks = "/dev/null";
+
         let mut full_args: Vec<String> =
             vec!["-C".to_string(), self.path.to_str().unwrap().to_string()];
+        full_args.push("-c".to_string());
+        full_args.push(format!("core.hooksPath={}", null_hooks));
         full_args.extend(args.iter().map(|s| s.to_string()));
 
         GitAiRepository::exec_git(&full_args)
@@ -324,9 +470,11 @@ impl TestRepo {
         envs: &[(&str, &str)],
         working_dir: Option<&std::path::Path>,
     ) -> Result<String, String> {
-        let binary_path = get_binary_path();
-
-        let mut command = Command::new(binary_path);
+        let mut command = if self.git_mode.uses_wrapper() {
+            Command::new(get_binary_path())
+        } else {
+            Command::new("git")
+        };
 
         // If working_dir is provided, use current_dir instead of -C flag
         // This tests that git-ai correctly finds the repository root when run from a subdirectory
@@ -347,16 +495,14 @@ impl TestRepo {
             command.args(&full_args);
         }
 
-        command.env("GIT_AI", "git");
+        self.configure_command_env(&mut command);
 
         // Add config patch as environment variable if present
-        if let Some(patch) = &self.config_patch {
-            if let Ok(patch_json) = serde_json::to_string(patch) {
-                command.env("GIT_AI_TEST_CONFIG_PATCH", patch_json);
-            }
+        if let Some(patch) = &self.config_patch
+            && let Ok(patch_json) = serde_json::to_string(patch)
+        {
+            command.env("GIT_AI_TEST_CONFIG_PATCH", patch_json);
         }
-
-        // Add test database path for isolation
         command.env("GIT_AI_TEST_DB_PATH", self.test_db_path.to_str().unwrap());
 
         // Add custom environment variables
@@ -364,10 +510,9 @@ impl TestRepo {
             command.env(key, value);
         }
 
-        let output = command.output().expect(&format!(
-            "Failed to execute git command with env: {:?}",
-            args
-        ));
+        let output = command
+            .output()
+            .unwrap_or_else(|_| panic!("Failed to execute git command with env: {:?}", args));
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -387,17 +532,66 @@ impl TestRepo {
         }
     }
 
+    pub fn git_ai_from_working_dir(
+        &self,
+        working_dir: &std::path::Path,
+        args: &[&str],
+    ) -> Result<String, String> {
+        let binary_path = get_binary_path();
+
+        let mut command = Command::new(binary_path);
+
+        let absolute_working_dir = working_dir.canonicalize().map_err(|e| {
+            format!(
+                "Failed to canonicalize working directory {}: {}",
+                working_dir.display(),
+                e
+            )
+        })?;
+        command.args(args).current_dir(&absolute_working_dir);
+        self.configure_git_ai_env(&mut command);
+
+        if let Some(patch) = &self.config_patch
+            && let Ok(patch_json) = serde_json::to_string(patch)
+        {
+            command.env("GIT_AI_TEST_CONFIG_PATCH", patch_json);
+        }
+
+        command.env("GIT_AI_TEST_DB_PATH", self.test_db_path.to_str().unwrap());
+
+        let output = command
+            .output()
+            .unwrap_or_else(|_| panic!("Failed to execute git-ai command: {:?}", args));
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+        if output.status.success() {
+            let combined = if stdout.is_empty() {
+                stderr
+            } else if stderr.is_empty() {
+                stdout
+            } else {
+                format!("{}{}", stdout, stderr)
+            };
+            Ok(combined)
+        } else {
+            Err(stderr)
+        }
+    }
+
     pub fn git_ai_with_env(&self, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
         let binary_path = get_binary_path();
 
         let mut command = Command::new(binary_path);
         command.args(args).current_dir(&self.path);
+        self.configure_git_ai_env(&mut command);
 
         // Add config patch as environment variable if present
-        if let Some(patch) = &self.config_patch {
-            if let Ok(patch_json) = serde_json::to_string(patch) {
-                command.env("GIT_AI_TEST_CONFIG_PATCH", patch_json);
-            }
+        if let Some(patch) = &self.config_patch
+            && let Ok(patch_json) = serde_json::to_string(patch)
+        {
+            command.env("GIT_AI_TEST_CONFIG_PATCH", patch_json);
         }
 
         // Add test database path for isolation
@@ -410,7 +604,7 @@ impl TestRepo {
 
         let output = command
             .output()
-            .expect(&format!("Failed to execute git-ai command: {:?}", args));
+            .unwrap_or_else(|_| panic!("Failed to execute git-ai command: {:?}", args));
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -444,17 +638,18 @@ impl TestRepo {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        self.configure_git_ai_env(&mut command);
 
         // Add config patch as environment variable if present
-        if let Some(patch) = &self.config_patch {
-            if let Ok(patch_json) = serde_json::to_string(patch) {
-                command.env("GIT_AI_TEST_CONFIG_PATCH", patch_json);
-            }
+        if let Some(patch) = &self.config_patch
+            && let Ok(patch_json) = serde_json::to_string(patch)
+        {
+            command.env("GIT_AI_TEST_CONFIG_PATCH", patch_json);
         }
 
         let mut child = command
             .spawn()
-            .expect(&format!("Failed to spawn git-ai command: {:?}", args));
+            .unwrap_or_else(|_| panic!("Failed to spawn git-ai command: {:?}", args));
 
         // Write stdin data
         if let Some(mut stdin) = child.stdin.take() {
@@ -465,7 +660,7 @@ impl TestRepo {
 
         let output = child
             .wait_with_output()
-            .expect(&format!("Failed to wait for git-ai command: {:?}", args));
+            .unwrap_or_else(|_| panic!("Failed to wait for git-ai command: {:?}", args));
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -485,7 +680,7 @@ impl TestRepo {
         }
     }
 
-    pub fn filename(&self, filename: &str) -> TestFile {
+    pub fn filename(&self, filename: &str) -> TestFile<'_> {
         let file_path = self.path.join(filename);
 
         // If file exists, populate from existing file with blame
@@ -513,7 +708,7 @@ impl TestRepo {
     }
 
     pub fn commit(&self, message: &str) -> Result<NewCommit, String> {
-        return self.commit_with_env(message, &[], None);
+        self.commit_with_env(message, &[], None)
     }
 
     /// Commit from a working directory (without using -C flag)
@@ -541,36 +736,35 @@ impl TestRepo {
         let output = self.git_with_env(&["commit", "-m", message], envs, working_dir);
 
         // println!("commit output: {:?}", output);
-        if output.is_ok() {
-            let combined = output.unwrap();
+        match output {
+            Ok(combined) => {
+                // Get the repository and HEAD commit SHA
+                let repo = GitAiRepository::find_repository_in_path(self.path.to_str().unwrap())
+                    .map_err(|e| format!("Failed to find repository: {}", e))?;
 
-            // Get the repository and HEAD commit SHA
-            let repo = GitAiRepository::find_repository_in_path(self.path.to_str().unwrap())
-                .map_err(|e| format!("Failed to find repository: {}", e))?;
+                let head_commit = repo
+                    .head()
+                    .map_err(|e| format!("Failed to get HEAD: {}", e))?
+                    .target()
+                    .map_err(|e| format!("Failed to get HEAD target: {}", e))?;
 
-            let head_commit = repo
-                .head()
-                .map_err(|e| format!("Failed to get HEAD: {}", e))?
-                .target()
-                .map_err(|e| format!("Failed to get HEAD target: {}", e))?;
+                // Get the authorship log for the new commit
+                let authorship_log =
+                    match git_ai::git::refs::show_authorship_note(&repo, &head_commit) {
+                        Some(content) => AuthorshipLog::deserialize_from_string(&content)
+                            .map_err(|e| format!("Failed to parse authorship log: {}", e))?,
+                        None => {
+                            return Err("No authorship log found for the new commit".to_string());
+                        }
+                    };
 
-            // Get the authorship log for the new commit
-            let authorship_log = match git_ai::git::refs::show_authorship_note(&repo, &head_commit)
-            {
-                Some(content) => AuthorshipLog::deserialize_from_string(&content)
-                    .map_err(|e| format!("Failed to parse authorship log: {}", e))?,
-                None => {
-                    return Err("No authorship log found for the new commit".to_string());
-                }
-            };
-
-            Ok(NewCommit {
-                commit_sha: head_commit,
-                authorship_log,
-                stdout: combined,
-            })
-        } else {
-            Err(output.unwrap_err())
+                Ok(NewCommit {
+                    commit_sha: head_commit,
+                    authorship_log,
+                    stdout: combined,
+                })
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -582,10 +776,53 @@ impl TestRepo {
 
 impl Drop for TestRepo {
     fn drop(&mut self) {
-        fs::remove_dir_all(self.path.clone()).expect("failed to remove test repo");
+        remove_dir_all_with_retry(&self.path, 80, Duration::from_millis(50))
+            .expect("failed to remove test repo");
         // Also clean up the test database directory (may not exist if no DB operations were done)
-        let _ = fs::remove_dir_all(self.test_db_path.clone());
+        let _ = remove_dir_all_with_retry(&self.test_db_path, 40, Duration::from_millis(25));
+        let _ = remove_dir_all_with_retry(&self.test_home, 40, Duration::from_millis(25));
     }
+}
+
+fn remove_dir_all_with_retry(
+    path: &std::path::Path,
+    attempts: usize,
+    delay: Duration,
+) -> std::io::Result<()> {
+    for attempt in 0..attempts {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) if should_retry_remove_dir_error(&err) => {
+                if attempt + 1 == attempts {
+                    return Err(err);
+                }
+                std::thread::sleep(delay);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(())
+}
+
+fn should_retry_remove_dir_error(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::DirectoryNotEmpty
+        || err.kind() == std::io::ErrorKind::PermissionDenied
+    {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows can report transient file locks as `Uncategorized` with raw code 32.
+        // Retry these so process teardown races don't fail otherwise-successful tests.
+        if let Some(code) = err.raw_os_error() {
+            return matches!(code, 5 | 32 | 145);
+        }
+    }
+
+    false
 }
 
 #[derive(Debug)]
@@ -609,17 +846,10 @@ static COMPILED_BINARY: OnceLock<PathBuf> = OnceLock::new();
 static DEFAULT_BRANCH_NAME: OnceLock<String> = OnceLock::new();
 
 fn get_default_branch_name() -> String {
-    let output = Command::new("git")
-        .args(["config", "--global", "init.defaultBranch"])
-        .output()
-        .expect("Failed to execute git config command");
-
-    if output.status.success() {
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    } else {
-        // Fallback to "master" if not configured
-        "master".to_string()
-    }
+    // Since TestRepo::new() explicitly sets the default branch to "main" via symbolic-ref,
+    // we always return "main" to match that behavior and ensure test consistency across
+    // different Git versions and configurations.
+    "main".to_string()
 }
 
 pub fn default_branchname() -> &'static str {
@@ -631,7 +861,7 @@ fn compile_binary() -> PathBuf {
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let output = Command::new("cargo")
-        .args(&["build", "--bin", "git-ai", "--features", "test-support"])
+        .args(["build", "--bin", "git-ai", "--features", "test-support"])
         .current_dir(manifest_dir)
         .output()
         .expect("Failed to compile git-ai binary");
@@ -644,10 +874,24 @@ fn compile_binary() -> PathBuf {
         );
     }
 
-    let binary_path = PathBuf::from(manifest_dir).join("target/debug/git-ai");
-    binary_path
+    // Respect CARGO_TARGET_DIR if set, otherwise fall back to manifest-relative target/
+    let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| {
+        PathBuf::from(manifest_dir)
+            .join("target")
+            .to_string_lossy()
+            .into_owned()
+    });
+    #[cfg(windows)]
+    {
+        PathBuf::from(target_dir).join("debug/git-ai.exe")
+    }
+
+    #[cfg(not(windows))]
+    {
+        PathBuf::from(target_dir).join("debug/git-ai")
+    }
 }
 
-pub(crate) fn get_binary_path() -> &'static PathBuf {
+pub fn get_binary_path() -> &'static PathBuf {
     COMPILED_BINARY.get_or_init(compile_binary)
 }

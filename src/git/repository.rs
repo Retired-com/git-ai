@@ -7,10 +7,269 @@ use crate::error::GitAiError;
 use crate::git::refs::get_authorship;
 use crate::git::repo_storage::RepoStorage;
 use crate::git::rewrite_log::RewriteLogEvent;
+use crate::git::status::MAX_PATHSPEC_ARGS;
 use crate::git::sync_authorship::{fetch_authorship_notes, push_authorship_notes};
+#[cfg(windows)]
+use crate::utils::is_interactive_terminal;
+
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(windows)]
+use crate::utils::CREATE_NO_WINDOW;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+// Keep a thread-local depth for low-overhead checks on the active thread and a process-global
+// depth so internal git spawned from background threads inherits suppression state.
+thread_local! {
+    static INTERNAL_GIT_HOOKS_DISABLED_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+static INTERNAL_GIT_HOOKS_DISABLED_DEPTH_GLOBAL: AtomicUsize = AtomicUsize::new(0);
+
+pub struct InternalGitHooksGuard;
+
+impl Drop for InternalGitHooksGuard {
+    fn drop(&mut self) {
+        INTERNAL_GIT_HOOKS_DISABLED_DEPTH.with(|depth| {
+            let current = depth.get();
+            if current > 0 {
+                depth.set(current - 1);
+            }
+        });
+        INTERNAL_GIT_HOOKS_DISABLED_DEPTH_GLOBAL.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Disable managed git hooks for internal `git` subprocesses executed through `exec_git*`.
+/// Use this guard around higher-level operations that already execute hook logic explicitly.
+pub fn disable_internal_git_hooks() -> InternalGitHooksGuard {
+    INTERNAL_GIT_HOOKS_DISABLED_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    INTERNAL_GIT_HOOKS_DISABLED_DEPTH_GLOBAL.fetch_add(1, Ordering::Relaxed);
+    InternalGitHooksGuard
+}
+
+fn should_disable_internal_git_hooks() -> bool {
+    INTERNAL_GIT_HOOKS_DISABLED_DEPTH.with(|depth| depth.get() > 0)
+        || INTERNAL_GIT_HOOKS_DISABLED_DEPTH_GLOBAL.load(Ordering::Relaxed) > 0
+}
+
+#[cfg(windows)]
+fn null_hooks_path() -> &'static str {
+    "NUL"
+}
+
+#[cfg(not(windows))]
+fn null_hooks_path() -> &'static str {
+    "/dev/null"
+}
+
+fn args_with_disabled_hooks_if_needed(args: &[String]) -> Vec<String> {
+    if !should_disable_internal_git_hooks() {
+        return args.to_vec();
+    }
+
+    // Respect explicit hook-path overrides if a caller already set one.
+    let already_overrides_hooks = args
+        .windows(2)
+        .any(|pair| pair[0] == "-c" && pair[1].starts_with("core.hooksPath="))
+        || args.iter().any(|arg| {
+            arg.starts_with("-ccore.hooksPath=") || arg.starts_with("--config=core.hooksPath=")
+        });
+
+    if already_overrides_hooks {
+        return args.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(args.len() + 2);
+    out.push("-c".to_string());
+    out.push(format!("core.hooksPath={}", null_hooks_path()));
+    out.extend(args.iter().cloned());
+    out
+}
+
+fn first_git_subcommand_index(args: &[String]) -> Option<usize> {
+    let mut index = 0usize;
+
+    while index < args.len() {
+        let arg = &args[index];
+
+        if !arg.starts_with('-') {
+            return Some(index);
+        }
+
+        let takes_value = matches!(
+            arg.as_str(),
+            "-C" | "-c"
+                | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--super-prefix"
+                | "--config-env"
+        );
+
+        index += if takes_value { 2 } else { 1 };
+    }
+
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InternalGitProfile {
+    General,
+    PatchParse,
+    NumstatParse,
+    RawDiffParse,
+}
+
+fn strip_profile_conflicts(args: Vec<String>, profile: InternalGitProfile) -> Vec<String> {
+    if profile == InternalGitProfile::General {
+        return args;
+    }
+
+    let Some(command_index) = first_git_subcommand_index(&args) else {
+        return args;
+    };
+
+    let should_drop = |arg: &str| -> bool {
+        match profile {
+            InternalGitProfile::General => false,
+            InternalGitProfile::PatchParse => {
+                arg == "--ext-diff"
+                    || arg == "--textconv"
+                    || arg == "--relative"
+                    || arg.starts_with("--relative=")
+                    || arg == "--color"
+                    || arg.starts_with("--color=")
+                    || arg == "--no-prefix"
+                    || arg == "--src-prefix"
+                    || arg == "--dst-prefix"
+                    || arg.starts_with("--src-prefix=")
+                    || arg.starts_with("--dst-prefix=")
+                    || arg.starts_with("--diff-algorithm=")
+                    || arg == "--no-indent-heuristic"
+                    || arg.starts_with("--inter-hunk-context=")
+            }
+            InternalGitProfile::NumstatParse => {
+                arg == "--ext-diff"
+                    || arg == "--textconv"
+                    || arg == "--relative"
+                    || arg.starts_with("--relative=")
+                    || arg == "--color"
+                    || arg.starts_with("--color=")
+                    || arg == "--find-renames"
+                    || arg.starts_with("--find-renames=")
+                    || arg == "--find-copies"
+                    || arg.starts_with("--find-copies=")
+                    || arg == "--find-copies-harder"
+                    || arg == "-M"
+                    || arg.starts_with("-M")
+                    || arg == "-C"
+                    || arg.starts_with("-C")
+            }
+            InternalGitProfile::RawDiffParse => {
+                arg == "--ext-diff"
+                    || arg == "--textconv"
+                    || arg == "--relative"
+                    || arg.starts_with("--relative=")
+                    || arg == "--color"
+                    || arg.starts_with("--color=")
+            }
+        }
+    };
+
+    let mut out = Vec::with_capacity(args.len());
+    out.extend(args[..=command_index].iter().cloned());
+
+    let mut index = command_index + 1;
+    while index < args.len() {
+        if args[index] == "--" {
+            out.extend(args[index..].iter().cloned());
+            return out;
+        }
+
+        let drop_current = should_drop(&args[index]);
+        if !drop_current {
+            out.push(args[index].clone());
+            index += 1;
+            continue;
+        }
+
+        // Handle split-arg forms we intentionally strip (e.g. --src-prefix X).
+        if matches!(profile, InternalGitProfile::PatchParse)
+            && (args[index] == "--src-prefix" || args[index] == "--dst-prefix")
+        {
+            index += 1;
+            if index < args.len() && args[index] != "--" {
+                index += 1;
+            }
+            continue;
+        }
+
+        index += 1;
+    }
+
+    out
+}
+
+fn profile_options(profile: InternalGitProfile) -> &'static [&'static str] {
+    match profile {
+        InternalGitProfile::General => &[],
+        InternalGitProfile::PatchParse => &[
+            "--no-ext-diff",
+            "--no-textconv",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--no-relative",
+            "--no-color",
+            "--diff-algorithm=default",
+            "--indent-heuristic",
+            "--inter-hunk-context=0",
+        ],
+        InternalGitProfile::NumstatParse => &[
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--no-relative",
+            "--no-renames",
+        ],
+        InternalGitProfile::RawDiffParse => &[
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--no-relative",
+        ],
+    }
+}
+
+fn args_with_internal_git_profile(args: &[String], profile: InternalGitProfile) -> Vec<String> {
+    if profile == InternalGitProfile::General {
+        return args.to_vec();
+    }
+
+    let args = strip_profile_conflicts(args.to_vec(), profile);
+    let Some(command_index) = first_git_subcommand_index(&args) else {
+        return args;
+    };
+
+    let options = profile_options(profile);
+    if options.is_empty() {
+        return args;
+    }
+
+    let mut out = Vec::with_capacity(args.len() + options.len());
+    out.extend(args[..=command_index].iter().cloned());
+    for option in options {
+        if !args.iter().any(|arg| arg == option) {
+            out.push((*option).to_string());
+        }
+    }
+    out.extend(args[command_index + 1..].iter().cloned());
+    out
+}
 
 pub struct Object<'a> {
     repo: &'a Repository,
@@ -49,6 +308,7 @@ pub struct CommitRange<'a> {
 
 impl<'a> CommitRange<'a> {
     /// Create an empty CommitRange with no commits in its iterator.
+    #[allow(dead_code)]
     pub fn empty(repo: &'a Repository) -> Self {
         Self {
             repo,
@@ -436,7 +696,7 @@ impl<'a> Commit<'a> {
         Ok(self.parents().count())
     }
 
-    // Get the short “summary” of the git commit message. The returned message is the summary of the commit, comprising the first paragraph of the message with whitespace trimmed and squashed. None may be returned if an error occurs or if the summary is not valid utf-8.
+    // Get the short "summary" of the git commit message. The returned message is the summary of the commit, comprising the first paragraph of the message with whitespace trimmed and squashed. None may be returned if an error occurs or if the summary is not valid utf-8.
     pub fn summary(&self) -> Result<String, GitAiError> {
         let mut args = self.repo.global_args_for_exec();
         args.push("show".to_string());
@@ -444,6 +704,20 @@ impl<'a> Commit<'a> {
         args.push("--no-notes".to_string());
         args.push("--encoding=UTF-8".to_string());
         args.push("--format=%s".to_string());
+        args.push(self.oid.clone());
+        let output = exec_git(&args)?;
+        Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    }
+
+    // Get the body of the git commit message (everything after the first paragraph).
+    // Returns an empty string if there is no body.
+    pub fn body(&self) -> Result<String, GitAiError> {
+        let mut args = self.repo.global_args_for_exec();
+        args.push("show".to_string());
+        args.push("-s".to_string());
+        args.push("--no-notes".to_string());
+        args.push("--encoding=UTF-8".to_string());
+        args.push("--format=%b".to_string());
         args.push(self.oid.clone());
         let output = exec_git(&args)?;
         Ok(String::from_utf8(output.stdout)?.trim().to_string())
@@ -508,13 +782,12 @@ impl<'a> Commit<'a> {
     // lazy load the authorship log
     #[allow(dead_code)]
     pub fn authorship(&self) -> &AuthorshipLog {
-        self.authorship_log.get_or_init(|| {
-            get_authorship(self.repo, self.oid.as_str()).unwrap_or_else(|| AuthorshipLog::new())
-        })
+        self.authorship_log
+            .get_or_init(|| get_authorship(self.repo, self.oid.as_str()).unwrap_or_default())
     }
     #[allow(dead_code)]
     pub fn authorship_uncached(&self) -> AuthorshipLog {
-        get_authorship(self.repo, self.oid.as_str()).unwrap_or_else(|| AuthorshipLog::new())
+        get_authorship(self.repo, self.oid.as_str()).unwrap_or_default()
     }
 
     /// Find the first parent that exists on the specified refname
@@ -621,6 +894,7 @@ impl<'a> Tree<'a> {
     }
 
     #[allow(dead_code)]
+    #[allow(clippy::should_implement_trait)]
     pub fn clone(&self) -> Tree<'a> {
         Tree {
             repo: self.repo,
@@ -864,13 +1138,13 @@ impl Repository {
         }
 
         // Safely handle empty repositories
-        if let Ok(head_ref) = self.head() {
-            if let Ok(target) = head_ref.target() {
-                let target_string = target;
-                let refname = head_ref.name().map(|n| n.to_string());
-                self.pre_command_base_commit = Some(target_string);
-                self.pre_command_refname = refname;
-            }
+        if let Ok(head_ref) = self.head()
+            && let Ok(target) = head_ref.target()
+        {
+            let target_string = target;
+            let refname = head_ref.name().map(|n| n.to_string());
+            self.pre_command_base_commit = Some(target_string);
+            self.pre_command_refname = refname;
         }
     }
 
@@ -884,21 +1158,17 @@ impl Repository {
         let log = self
             .storage
             .append_rewrite_event(rewrite_log_event.clone())
-            .ok()
             .expect("Error writing .git/ai/rewrite_log");
 
-        if apply_side_effects {
-            match rewrite_authorship_if_needed(
+        if apply_side_effects
+            && let Ok(_) = rewrite_authorship_if_needed(
                 self,
                 &rewrite_log_event,
                 commit_author,
                 &log,
                 supress_output,
-            ) {
-                Ok(_) => (),
-                Err(_) => {}
-            }
-        }
+            )
+        {}
     }
 
     // Internal util to get the git object type for a given OID
@@ -948,6 +1218,16 @@ impl Repository {
     pub fn workdir(&self) -> Result<PathBuf, GitAiError> {
         // TODO Remove Result since this is determined at initialization now
         Ok(self.workdir.clone())
+    }
+
+    /// Returns true when this repository is bare.
+    pub fn is_bare_repository(&self) -> Result<bool, GitAiError> {
+        let mut args = self.global_args_for_exec();
+        args.push("rev-parse".to_string());
+        args.push("--is-bare-repository".to_string());
+        let output = exec_git(&args)?;
+        let value = String::from_utf8(output.stdout)?;
+        Ok(value.trim() == "true")
     }
 
     /// Get the canonical (absolute, resolved) path of the working directory
@@ -1037,6 +1317,11 @@ impl Repository {
     }
 
     /// Get all config values matching a regex pattern.
+    ///
+    /// Regular expression matching is currently case-sensitive
+    /// and done against a canonicalized version of the key
+    /// in which section and variable names are lowercased, but subsection names are not.
+    ///
     /// Returns a HashMap of key -> value for all matching config entries.
     pub fn config_get_regexp(
         &self,
@@ -1063,12 +1348,11 @@ impl Repository {
                             format!("{}.{}", section_name, value_name_str)
                         };
 
-                        if re.is_match(&full_key) {
-                            if let Some(value) =
+                        if re.is_match(&full_key)
+                            && let Some(value) =
                                 section.body().value(value_name).map(|c| c.to_string())
-                            {
-                                matches.insert(full_key, value);
-                            }
+                        {
+                            matches.insert(full_key, value);
                         }
                     }
                 }
@@ -1198,7 +1482,7 @@ impl Repository {
         &self,
         branch_refname: &str,
         merge_target_refname: &str,
-    ) -> Result<CommitRange, GitAiError> {
+    ) -> Result<CommitRange<'_>, GitAiError> {
         // Normalize the provided branch ref to fully qualified using rev-parse
         let fq_branch = {
             let mut rp_args = self.global_args_for_exec();
@@ -1262,12 +1546,16 @@ impl Repository {
             }
         };
 
-        // Build: git log --format=%H --reverse --ancestry-path <branch> --not <other branches>
+        // Build: git log --format=%H --reverse <branch> --not <merge_target>
+        // Note: we intentionally do NOT use --ancestry-path here. That flag requires
+        // commits to be descendants of the merge-target's tip, which fails when the
+        // merge target was previously merged INTO the branch (a common workflow to
+        // stay up-to-date). In that case, the branch's unique commits descend from
+        // the pre-merge side and --ancestry-path filters them all out.
         let mut log_args = self.global_args_for_exec();
         log_args.push("log".to_string());
         log_args.push("--format=%H".to_string());
         log_args.push("--reverse".to_string());
-        log_args.push("--ancestry-path".to_string());
         log_args.push(fq_branch.to_string());
         log_args.push("--not".to_string());
         log_args.push(fq_merge_target.to_string());
@@ -1294,12 +1582,7 @@ impl Repository {
         let first_commit = commits.first().unwrap().to_string();
         let last_commit = commits.last().unwrap().to_string();
 
-        Ok(CommitRange::new(
-            self,
-            first_commit,
-            last_commit,
-            fq_branch.to_string(),
-        )?)
+        CommitRange::new(self, first_commit, last_commit, fq_branch.to_string())
     }
 
     // Create new commit in the repository If the update_ref is not None, name of the reference that will be updated to point to this commit. If the reference is not direct, it will be resolved to a direct reference. Use "HEAD" to update the HEAD of the current branch and make it point to this commit. If the reference doesn't exist yet, it will be created. If it does exist, the first parent must be the tip of this branch.
@@ -1344,13 +1627,14 @@ impl Repository {
         let committer_date = fmt_git_date(committer.when());
 
         // Build env for commit-tree
-        let mut env: Vec<(String, String)> = Vec::new();
-        env.push(("GIT_AUTHOR_NAME".to_string(), author_name));
-        env.push(("GIT_AUTHOR_EMAIL".to_string(), author_email));
-        env.push(("GIT_AUTHOR_DATE".to_string(), author_date));
-        env.push(("GIT_COMMITTER_NAME".to_string(), committer_name));
-        env.push(("GIT_COMMITTER_EMAIL".to_string(), committer_email));
-        env.push(("GIT_COMMITTER_DATE".to_string(), committer_date));
+        let env: Vec<(String, String)> = vec![
+            ("GIT_AUTHOR_NAME".to_string(), author_name),
+            ("GIT_AUTHOR_EMAIL".to_string(), author_email),
+            ("GIT_AUTHOR_DATE".to_string(), author_date),
+            ("GIT_COMMITTER_NAME".to_string(), committer_name),
+            ("GIT_COMMITTER_EMAIL".to_string(), committer_email),
+            ("GIT_COMMITTER_DATE".to_string(), committer_date),
+        ];
 
         // 1) Create the commit object via commit-tree, piping message on stdin
         let mut ct_args = self.global_args_for_exec();
@@ -1380,15 +1664,11 @@ impl Repository {
             rp_args.push("--verify".to_string());
             rp_args.push(target_ref.clone());
 
-            let old_tip: Option<String> = match Command::new(config::Config::get().git_cmd())
-                .args(&rp_args)
-                .output()
-            {
-                Ok(output) if output.status.success() => {
-                    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-                }
-                _ => None,
-            };
+            let old_tip: Option<String> =
+                match exec_git_with_profile(&rp_args, InternalGitProfile::General) {
+                    Ok(output) => Some(String::from_utf8_lossy(&output.stdout).trim().to_string()),
+                    Err(_) => None,
+                };
 
             // Enforce first-parent matches current tip if ref exists
             if let Some(ref tip) = old_tip {
@@ -1439,29 +1719,29 @@ impl Repository {
     // Non-standard method of getting a 'default' remote
     pub fn get_default_remote(&self) -> Result<Option<String>, GitAiError> {
         let remotes = self.remotes()?;
-        if remotes.len() == 0 {
+        if remotes.is_empty() {
             return Ok(None);
         }
         // Prefer 'origin' if it exists
         for i in 0..remotes.len() {
-            if let Some(name) = remotes.get(i) {
-                if name == "origin" {
-                    return Ok(Some("origin".to_string()));
-                }
+            if let Some(name) = remotes.get(i)
+                && name == "origin"
+            {
+                return Ok(Some("origin".to_string()));
             }
         }
         // Otherwise, just use the first remote
-        Ok(remotes.get(0).map(|s| s.to_string()))
+        Ok(remotes.first().map(|s| s.to_string()))
     }
 
     #[allow(dead_code)]
-    pub fn fetch_authorship<'a>(&'a self, remote_name: &str) -> Result<(), GitAiError> {
+    pub fn fetch_authorship(&self, remote_name: &str) -> Result<(), GitAiError> {
         // Discards whether notes were found or not, just returns success/error
         fetch_authorship_notes(self, remote_name).map(|_| ())
     }
 
     #[allow(dead_code)]
-    pub fn push_authorship<'a>(&'a self, remote_name: &str) -> Result<(), GitAiError> {
+    pub fn push_authorship(&self, remote_name: &str) -> Result<(), GitAiError> {
         push_authorship_notes(self, remote_name)
     }
 
@@ -1652,6 +1932,7 @@ impl Repository {
         args.push("--no-commit-id".to_string());
         args.push("--name-only".to_string());
         args.push("-r".to_string());
+        args.push("-z".to_string()); // NUL-separated output for proper UTF-8 handling
 
         // Find the commit to check if it has a parent
         let commit = self.find_commit(commit_sha.to_string())?;
@@ -1664,27 +1945,39 @@ impl Repository {
 
         args.push(commit_sha.to_string());
 
-        // Add pathspecs if provided
-        if let Some(paths) = pathspecs {
+        // Add pathspecs if provided (only as CLI args when under threshold)
+        let needs_post_filter = if let Some(paths) = pathspecs {
             // for case where pathspec filter provided BUT not pathspecs.
             // otherwise it would default to full repo
             if paths.is_empty() {
                 return Ok(HashSet::new());
             }
-            args.push("--".to_string());
-            for path in paths {
-                args.push(path.clone());
+            if paths.len() > MAX_PATHSPEC_ARGS {
+                true
+            } else {
+                args.push("--".to_string());
+                for path in paths {
+                    args.push(path.clone());
+                }
+                false
             }
-        }
+        } else {
+            false
+        };
 
         let output = exec_git(&args)?;
-        let stdout = String::from_utf8(output.stdout)?;
 
-        let files: HashSet<String> = stdout
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(|line| line.to_string())
+        // With -z, output is NUL-separated. The output may contain a trailing NUL.
+        let mut files: HashSet<String> = output
+            .stdout
+            .split(|&b| b == 0)
+            .filter(|bytes| !bytes.is_empty())
+            .filter_map(|bytes| String::from_utf8(bytes.to_vec()).ok())
             .collect();
+
+        if needs_post_filter && let Some(paths) = pathspecs {
+            files.retain(|path| paths.contains(path));
+        }
 
         Ok(files)
     }
@@ -1705,26 +1998,40 @@ impl Repository {
         args.push("diff".to_string());
         args.push("-U0".to_string()); // Zero context lines
         args.push("--no-color".to_string());
+        args.push("--no-renames".to_string());
         args.push(from_ref.to_string());
         args.push(to_ref.to_string());
 
-        // Add pathspecs if provided
-        if let Some(paths) = pathspecs {
+        // Add pathspecs if provided (only as CLI args when under threshold)
+        let needs_post_filter = if let Some(paths) = pathspecs {
             // for case where pathspec filter provided BUT not pathspecs.
             // otherwise it would default to full repo
             if paths.is_empty() {
                 return Ok(HashMap::new());
             }
-            args.push("--".to_string());
-            for path in paths {
-                args.push(path.clone());
+            if paths.len() > MAX_PATHSPEC_ARGS {
+                true
+            } else {
+                args.push("--".to_string());
+                for path in paths {
+                    args.push(path.clone());
+                }
+                false
             }
+        } else {
+            false
+        };
+
+        let output = exec_git_with_profile(&args, InternalGitProfile::PatchParse)?;
+        let diff_output = String::from_utf8_lossy(&output.stdout);
+
+        let mut result = parse_diff_added_lines(&diff_output)?;
+
+        if needs_post_filter && let Some(paths) = pathspecs {
+            result.retain(|path, _| paths.contains(path));
         }
 
-        let output = exec_git(&args)?;
-        let diff_output = String::from_utf8(output.stdout)?;
-
-        parse_diff_added_lines(&diff_output)
+        Ok(result)
     }
 
     /// Get list of changed files between two refs using `git diff --name-only`
@@ -1737,16 +2044,19 @@ impl Repository {
         let mut args = self.global_args_for_exec();
         args.push("diff".to_string());
         args.push("--name-only".to_string());
+        args.push("-z".to_string()); // NUL-separated output for proper UTF-8 handling
+        args.push("--no-renames".to_string());
         args.push(from_ref.to_string());
         args.push(to_ref.to_string());
 
-        let output = exec_git(&args)?;
-        let stdout = String::from_utf8(output.stdout)?;
+        let output = exec_git_with_profile(&args, InternalGitProfile::RawDiffParse)?;
 
-        let files: Vec<String> = stdout
-            .lines()
-            .filter(|line| !line.is_empty())
-            .map(|line| line.to_string())
+        // With -z, output is NUL-separated. The output may contain a trailing NUL.
+        let files: Vec<String> = output
+            .stdout
+            .split(|&b| b == 0)
+            .filter(|bytes| !bytes.is_empty())
+            .filter_map(|bytes| String::from_utf8(bytes.to_vec()).ok())
             .collect();
 
         Ok(files)
@@ -1766,25 +2076,39 @@ impl Repository {
         args.push("diff".to_string());
         args.push("-U0".to_string()); // Zero context lines
         args.push("--no-color".to_string());
+        args.push("--no-renames".to_string());
         args.push(from_ref.to_string());
 
-        // Add pathspecs if provided
-        if let Some(paths) = pathspecs {
+        // Add pathspecs if provided (only as CLI args when under threshold)
+        let needs_post_filter = if let Some(paths) = pathspecs {
             // for case where pathspec filter provided BUT not pathspecs.
             // otherwise it would default to full repo
             if paths.is_empty() {
                 return Ok(HashMap::new());
             }
-            args.push("--".to_string());
-            for path in paths {
-                args.push(path.clone());
+            if paths.len() > MAX_PATHSPEC_ARGS {
+                true
+            } else {
+                args.push("--".to_string());
+                for path in paths {
+                    args.push(path.clone());
+                }
+                false
             }
+        } else {
+            false
+        };
+
+        let output = exec_git_with_profile(&args, InternalGitProfile::PatchParse)?;
+        let diff_output = String::from_utf8_lossy(&output.stdout);
+
+        let mut result = parse_diff_added_lines(&diff_output)?;
+
+        if needs_post_filter && let Some(paths) = pathspecs {
+            result.retain(|path, _| paths.contains(path));
         }
 
-        let output = exec_git(&args)?;
-        let diff_output = String::from_utf8(output.stdout)?;
-
-        parse_diff_added_lines(&diff_output)
+        Ok(result)
     }
 
     /// Get added line ranges from git diff between a commit and the working directory,
@@ -1792,6 +2116,7 @@ impl Repository {
     ///
     /// Returns (all_added_lines, pure_insertion_lines)
     /// Pure insertions are lines that were added without modifying existing lines at that position.
+    #[allow(clippy::type_complexity)]
     pub fn diff_workdir_added_lines_with_insertions(
         &self,
         from_ref: &str,
@@ -1801,25 +2126,41 @@ impl Repository {
         args.push("diff".to_string());
         args.push("-U0".to_string()); // Zero context lines
         args.push("--no-color".to_string());
+        args.push("--no-renames".to_string());
         args.push(from_ref.to_string());
 
-        // Add pathspecs if provided
-        if let Some(paths) = pathspecs {
+        // Add pathspecs if provided (only as CLI args when under threshold)
+        let needs_post_filter = if let Some(paths) = pathspecs {
             // for case where pathspec filter provided BUT not pathspecs.
             // otherwise it would default to full repo
             if paths.is_empty() {
                 return Ok((HashMap::new(), HashMap::new()));
             }
-            args.push("--".to_string());
-            for path in paths {
-                args.push(path.clone());
+            if paths.len() > MAX_PATHSPEC_ARGS {
+                true
+            } else {
+                args.push("--".to_string());
+                for path in paths {
+                    args.push(path.clone());
+                }
+                false
             }
+        } else {
+            false
+        };
+
+        let output = exec_git_with_profile(&args, InternalGitProfile::PatchParse)?;
+        let diff_output = String::from_utf8_lossy(&output.stdout);
+
+        let (mut all_added, mut pure_insertions) =
+            parse_diff_added_lines_with_insertions(&diff_output)?;
+
+        if needs_post_filter && let Some(paths) = pathspecs {
+            all_added.retain(|path, _| paths.contains(path));
+            pure_insertions.retain(|path, _| paths.contains(path));
         }
 
-        let output = exec_git(&args)?;
-        let diff_output = String::from_utf8(output.stdout)?;
-
-        parse_diff_added_lines_with_insertions(&diff_output)
+        Ok((all_added, pure_insertions))
     }
 
     pub fn fetch_branch(&self, branch_name: &str, remote_name: &str) -> Result<(), GitAiError> {
@@ -1832,36 +2173,70 @@ impl Repository {
     }
 }
 
-pub fn find_repository(global_args: &Vec<String>) -> Result<Repository, GitAiError> {
-    let mut args = global_args.clone();
-    args.push("rev-parse".to_string());
-    args.push("--absolute-git-dir".to_string());
-    args.push("--show-toplevel".to_string());
+pub fn find_repository(global_args: &[String]) -> Result<Repository, GitAiError> {
+    let mut rev_parse_args = global_args.to_owned();
+    rev_parse_args.push("rev-parse".to_string());
+    // Use --git-dir instead of --absolute-git-dir for compatibility with Git < 2.13
+    // (--absolute-git-dir was added in Git 2.13; older versions output the literal
+    // string "absolute-git-dir" instead of the resolved path).
+    rev_parse_args.push("--is-bare-repository".to_string());
+    rev_parse_args.push("--git-dir".to_string());
 
-    let output = exec_git(&args)?;
-    let both_dirs = String::from_utf8(output.stdout)?;
+    let rev_parse_output = exec_git(&rev_parse_args)?;
+    let rev_parse_stdout = String::from_utf8(rev_parse_output.stdout)?;
+    let mut lines = rev_parse_stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
 
-    let both_dirs = both_dirs.trim();
-    let lines: Vec<&str> = both_dirs.split("\n").collect();
+    let is_bare = match lines.next() {
+        Some("true") => true,
+        Some("false") => false,
+        Some(other) => {
+            return Err(GitAiError::Generic(format!(
+                "Unexpected --is-bare-repository output: {}",
+                other
+            )));
+        }
+        None => {
+            return Err(GitAiError::Generic(
+                "Missing --is-bare-repository output from git rev-parse".to_string(),
+            ));
+        }
+    };
 
-    if lines.len() < 2 {
-        return Err(GitAiError::Generic(format!(
-            "Expected git rev-parse to return 2 lines (git dir and work dir), got {}:\n{}",
-            lines.len(),
-            both_dirs
-        )));
-    }
+    let git_dir_str = lines.next().ok_or_else(|| {
+        GitAiError::Generic("Missing --git-dir output from git rev-parse".to_string())
+    })?;
+    let command_base_dir = resolve_command_base_dir(global_args)?;
+    let git_dir = if Path::new(git_dir_str).is_relative() {
+        command_base_dir.join(git_dir_str)
+    } else {
+        PathBuf::from(git_dir_str)
+    };
 
-    let git_dir_str = lines[0];
-    let workdir_str = lines[1];
-    let git_dir = PathBuf::from(git_dir_str);
-    let workdir = PathBuf::from(workdir_str);
     if !git_dir.is_dir() {
         return Err(GitAiError::Generic(format!(
             "Git directory does not exist: {}",
             git_dir.display()
         )));
     }
+
+    let workdir = if is_bare {
+        git_dir.parent().map(Path::to_path_buf).ok_or_else(|| {
+            GitAiError::Generic(format!(
+                "Git directory has no parent: {}",
+                git_dir.display()
+            ))
+        })?
+    } else {
+        let mut top_level_args = global_args.to_owned();
+        top_level_args.push("rev-parse".to_string());
+        top_level_args.push("--show-toplevel".to_string());
+        let output = exec_git(&top_level_args)?;
+        PathBuf::from(String::from_utf8(output.stdout)?.trim())
+    };
+
     if !workdir.is_dir() {
         return Err(GitAiError::Generic(format!(
             "Work directory does not exist: {}",
@@ -1869,17 +2244,21 @@ pub fn find_repository(global_args: &Vec<String>) -> Result<Repository, GitAiErr
         )));
     }
 
-    // Ensure all internal git commands use the repository root consistently
-    // When running from a subdirectory without -C, add it to ensure hooks work correctly
-    let mut global_args = global_args.clone();
-    let workdir_str = workdir.display().to_string();
+    // Ensure all internal git commands use a stable repository root consistently.
+    let mut normalized_global_args = global_args.to_owned();
+    let command_root = if is_bare {
+        git_dir.display().to_string()
+    } else {
+        workdir.display().to_string()
+    };
 
-    if global_args.is_empty() {
-        // Add -C flag when not present (e.g., when running from subdirectory)
-        global_args = vec!["-C".to_string(), workdir_str];
-    } else if global_args.len() == 2 && global_args[0] == "-C" && global_args[1] != workdir_str {
-        // Rewrite existing -C to repo root if it points elsewhere
-        global_args[1] = workdir_str;
+    if normalized_global_args.is_empty() {
+        normalized_global_args = vec!["-C".to_string(), command_root];
+    } else if normalized_global_args.len() == 2
+        && normalized_global_args[0] == "-C"
+        && normalized_global_args[1] != command_root
+    {
+        normalized_global_args[1] = command_root;
     }
 
     // Canonicalize workdir for reliable path comparisons (especially on Windows)
@@ -1894,7 +2273,7 @@ pub fn find_repository(global_args: &Vec<String>) -> Result<Repository, GitAiErr
     })?;
 
     Ok(Repository {
-        global_args: global_args.clone(),
+        global_args: normalized_global_args,
         storage: RepoStorage::for_repo_path(&git_dir, &workdir),
         git_dir,
         pre_command_base_commit: None,
@@ -1903,6 +2282,31 @@ pub fn find_repository(global_args: &Vec<String>) -> Result<Repository, GitAiErr
         workdir,
         canonical_workdir,
     })
+}
+
+fn resolve_command_base_dir(global_args: &[String]) -> Result<PathBuf, GitAiError> {
+    let mut base = std::env::current_dir().map_err(GitAiError::IoError)?;
+    let mut idx = 0usize;
+
+    while idx < global_args.len() {
+        if global_args[idx] == "-C" {
+            let path_arg = global_args.get(idx + 1).ok_or_else(|| {
+                GitAiError::Generic("Missing path after -C in global git args".to_string())
+            })?;
+
+            let next_base = PathBuf::from(path_arg);
+            base = if next_base.is_absolute() {
+                next_base
+            } else {
+                base.join(next_base)
+            };
+            idx += 2;
+            continue;
+        }
+        idx += 1;
+    }
+
+    Ok(base)
 }
 
 #[allow(dead_code)]
@@ -1929,7 +2333,7 @@ pub fn from_bare_repository(git_dir: &Path) -> Result<Repository, GitAiError> {
 
 pub fn find_repository_in_path(path: &str) -> Result<Repository, GitAiError> {
     let global_args = vec!["-C".to_string(), path.to_string()];
-    return find_repository(&global_args);
+    find_repository(&global_args)
 }
 
 /// Find the git repository that contains the given file path by walking up the directory tree.
@@ -1938,9 +2342,9 @@ pub fn find_repository_in_path(path: &str) -> Result<Repository, GitAiError> {
 /// root itself may not be a git repository, but contains multiple independent git repositories.
 ///
 /// # Arguments
-/// * `file_path` - Absolute path to a file
-/// * `workspace_root` - Optional workspace root path. If provided, the search will stop at this
-///                      boundary to avoid finding repositories outside the workspace.
+///  * `file_path` - Absolute path to a file
+///  * `workspace_root` - Optional workspace root path. If provided, the search will stop at this
+///    boundary to avoid finding repositories outside the workspace.
 ///
 /// # Returns
 /// * `Ok(Repository)` - The repository containing the file
@@ -1991,12 +2395,13 @@ pub fn find_repository_for_file(
             // Submodules have a .git file (not directory) that points to the parent's .git/modules
             if git_path.is_file() {
                 // This is a submodule - read the file to check if it points to modules/
-                if let Ok(content) = std::fs::read_to_string(&git_path) {
-                    if content.contains("gitdir:") && content.contains("/modules/") {
-                        // This is a submodule, skip it and continue searching up
-                        current_dir = dir.parent();
-                        continue;
-                    }
+                if let Ok(content) = std::fs::read_to_string(&git_path)
+                    && content.contains("gitdir:")
+                    && content.contains("/modules/")
+                {
+                    // This is a submodule, skip it and continue searching up
+                    current_dir = dir.parent();
+                    continue;
                 }
             }
 
@@ -2026,6 +2431,7 @@ pub fn find_repository_for_file(
 /// A tuple of:
 /// * `HashMap<PathBuf, (Repository, Vec<String>)>` - Map of repo root to (repo, file paths)
 /// * `Vec<String>` - Files that couldn't be associated with any repository
+#[allow(clippy::type_complexity)]
 pub fn group_files_by_repository(
     file_paths: &[String],
     workspace_root: Option<&str>,
@@ -2061,11 +2467,30 @@ pub fn group_files_by_repository(
 
 /// Helper to execute a git command
 pub fn exec_git(args: &[String]) -> Result<Output, GitAiError> {
+    exec_git_with_profile(args, InternalGitProfile::General)
+}
+
+/// Helper to execute a git command with an explicit internal profile.
+pub fn exec_git_with_profile(
+    args: &[String],
+    profile: InternalGitProfile,
+) -> Result<Output, GitAiError> {
     // TODO Make sure to handle process signals, etc.
-    let output = Command::new(config::Config::get().git_cmd())
-        .args(args)
-        .output()
-        .map_err(GitAiError::IoError)?;
+    let effective_args =
+        args_with_internal_git_profile(&args_with_disabled_hooks_if_needed(args), profile);
+    let mut cmd = Command::new(config::Config::get().git_cmd());
+    cmd.args(&effective_args);
+    cmd.env_remove("GIT_EXTERNAL_DIFF");
+    cmd.env_remove("GIT_DIFF_OPTS");
+
+    #[cfg(windows)]
+    {
+        if !is_interactive_terminal() {
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+    }
+
+    let output = cmd.output().map_err(GitAiError::IoError)?;
 
     if !output.status.success() {
         let code = output.status.code();
@@ -2073,7 +2498,7 @@ pub fn exec_git(args: &[String]) -> Result<Output, GitAiError> {
         return Err(GitAiError::GitCliError {
             code,
             stderr,
-            args: args.to_vec(),
+            args: effective_args,
         });
     }
 
@@ -2082,54 +2507,31 @@ pub fn exec_git(args: &[String]) -> Result<Output, GitAiError> {
 
 /// Helper to execute a git command with data provided on stdin
 pub fn exec_git_stdin(args: &[String], stdin_data: &[u8]) -> Result<Output, GitAiError> {
-    // TODO Make sure to handle process signals, etc.
-    let mut child = Command::new(config::Config::get().git_cmd())
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(GitAiError::IoError)?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        if let Err(e) = stdin.write_all(stdin_data) {
-            return Err(GitAiError::IoError(e));
-        }
-    }
-
-    let output = child.wait_with_output().map_err(GitAiError::IoError)?;
-
-    if !output.status.success() {
-        let code = output.status.code();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        return Err(GitAiError::GitCliError {
-            code,
-            stderr,
-            args: args.to_vec(),
-        });
-    }
-
-    Ok(output)
+    exec_git_stdin_with_profile(args, stdin_data, InternalGitProfile::General)
 }
 
-/// Helper to execute a git command with data provided on stdin and additional environment variables
-#[allow(dead_code)]
-pub fn exec_git_stdin_with_env(
+/// Helper to execute a git command with data provided on stdin and an explicit profile.
+pub fn exec_git_stdin_with_profile(
     args: &[String],
-    env: &Vec<(String, String)>,
     stdin_data: &[u8],
+    profile: InternalGitProfile,
 ) -> Result<Output, GitAiError> {
     // TODO Make sure to handle process signals, etc.
+    let effective_args =
+        args_with_internal_git_profile(&args_with_disabled_hooks_if_needed(args), profile);
     let mut cmd = Command::new(config::Config::get().git_cmd());
-    cmd.args(args)
+    cmd.args(&effective_args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    cmd.env_remove("GIT_EXTERNAL_DIFF");
+    cmd.env_remove("GIT_DIFF_OPTS");
 
-    // Apply env overrides
-    for (k, v) in env.iter() {
-        cmd.env(k, v);
+    #[cfg(windows)]
+    {
+        if !is_interactive_terminal() {
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
     }
 
     let mut child = cmd.spawn().map_err(GitAiError::IoError)?;
@@ -2149,7 +2551,72 @@ pub fn exec_git_stdin_with_env(
         return Err(GitAiError::GitCliError {
             code,
             stderr,
-            args: args.to_vec(),
+            args: effective_args,
+        });
+    }
+
+    Ok(output)
+}
+
+/// Helper to execute a git command with data provided on stdin and additional environment variables
+#[allow(dead_code)]
+pub fn exec_git_stdin_with_env(
+    args: &[String],
+    env: &[(String, String)],
+    stdin_data: &[u8],
+) -> Result<Output, GitAiError> {
+    exec_git_stdin_with_env_with_profile(args, env, stdin_data, InternalGitProfile::General)
+}
+
+/// Helper to execute a git command with data provided on stdin, env overrides, and profile.
+#[allow(dead_code)]
+pub fn exec_git_stdin_with_env_with_profile(
+    args: &[String],
+    env: &[(String, String)],
+    stdin_data: &[u8],
+    profile: InternalGitProfile,
+) -> Result<Output, GitAiError> {
+    // TODO Make sure to handle process signals, etc.
+    let effective_args =
+        args_with_internal_git_profile(&args_with_disabled_hooks_if_needed(args), profile);
+    let mut cmd = Command::new(config::Config::get().git_cmd());
+    cmd.args(&effective_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    // Apply env overrides
+    for (k, v) in env.iter() {
+        cmd.env(k, v);
+    }
+    cmd.env_remove("GIT_EXTERNAL_DIFF");
+    cmd.env_remove("GIT_DIFF_OPTS");
+
+    #[cfg(windows)]
+    {
+        if !is_interactive_terminal() {
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+    }
+
+    let mut child = cmd.spawn().map_err(GitAiError::IoError)?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        if let Err(e) = stdin.write_all(stdin_data) {
+            return Err(GitAiError::IoError(e));
+        }
+    }
+
+    let output = child.wait_with_output().map_err(GitAiError::IoError)?;
+
+    if !output.status.success() {
+        let code = output.status.code();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(GitAiError::GitCliError {
+            code,
+            stderr,
+            args: effective_args,
         });
     }
 
@@ -2194,27 +2661,14 @@ fn parse_diff_added_lines(diff_output: &str) -> Result<HashMap<String, Vec<u32>>
     let mut current_file: Option<String> = None;
 
     for line in diff_output.lines() {
-        // Track current file being diffed
-        // Git may add trailing tabs to file paths in diff output, so we trim them
-        // Git may also quote file names containing spaces: +++ "b/my file.txt"
-        if line.starts_with("+++ b/") {
-            current_file = Some(line[6..].trim_end().to_string());
-        } else if line.starts_with("+++ \"b/") && line.trim_end().ends_with('"') {
-            // Handle quoted path: +++ "b/my file.txt"
-            let trimmed = line.trim_end();
-            current_file = Some(trimmed[7..trimmed.len() - 1].to_string());
-        } else if line.starts_with("+++ /dev/null") {
-            // File was deleted
-            current_file = None;
+        if let Some(path_opt) = parse_new_file_path_from_plus_header_line(line) {
+            current_file = path_opt;
         } else if line.starts_with("@@ ") {
             // Parse hunk header: @@ -old_start,old_count +new_start,new_count @@
-            if let Some(ref file) = current_file {
-                if let Some((added_lines, _is_pure_insertion)) = parse_hunk_header(line) {
-                    result
-                        .entry(file.clone())
-                        .or_insert_with(Vec::new)
-                        .extend(added_lines);
-                }
+            if let Some(ref file) = current_file
+                && let Some((added_lines, _is_pure_insertion)) = parse_hunk_header(line)
+            {
+                result.entry(file.clone()).or_default().extend(added_lines);
             }
         }
     }
@@ -2232,6 +2686,7 @@ fn parse_diff_added_lines(diff_output: &str) -> Result<HashMap<String, Vec<u32>>
 /// along with information about which are pure insertions (old_count=0).
 ///
 /// Returns (all_added_lines, pure_insertion_lines)
+#[allow(clippy::type_complexity)]
 fn parse_diff_added_lines_with_insertions(
     diff_output: &str,
 ) -> Result<(HashMap<String, Vec<u32>>, HashMap<String, Vec<u32>>), GitAiError> {
@@ -2240,33 +2695,23 @@ fn parse_diff_added_lines_with_insertions(
     let mut current_file: Option<String> = None;
 
     for line in diff_output.lines() {
-        // Track current file being diffed
-        // Git may add trailing tabs to file paths in diff output, so we trim them
-        // Git may also quote file names containing spaces: +++ "b/my file.txt"
-        if line.starts_with("+++ b/") {
-            current_file = Some(line[6..].trim_end().to_string());
-        } else if line.starts_with("+++ \"b/") && line.trim_end().ends_with('"') {
-            // Handle quoted path: +++ "b/my file.txt"
-            let trimmed = line.trim_end();
-            current_file = Some(trimmed[7..trimmed.len() - 1].to_string());
-        } else if line.starts_with("+++ /dev/null") {
-            // File was deleted
-            current_file = None;
+        if let Some(path_opt) = parse_new_file_path_from_plus_header_line(line) {
+            current_file = path_opt;
         } else if line.starts_with("@@ ") {
             // Parse hunk header: @@ -old_start,old_count +new_start,new_count @@
-            if let Some(ref file) = current_file {
-                if let Some((added_lines, is_pure_insertion)) = parse_hunk_header(line) {
-                    all_lines
-                        .entry(file.clone())
-                        .or_insert_with(Vec::new)
-                        .extend(added_lines.clone());
+            if let Some(ref file) = current_file
+                && let Some((added_lines, is_pure_insertion)) = parse_hunk_header(line)
+            {
+                all_lines
+                    .entry(file.clone())
+                    .or_default()
+                    .extend(added_lines.clone());
 
-                    if is_pure_insertion {
-                        insertion_lines
-                            .entry(file.clone())
-                            .or_insert_with(Vec::new)
-                            .extend(added_lines);
-                    }
+                if is_pure_insertion {
+                    insertion_lines
+                        .entry(file.clone())
+                        .or_default()
+                        .extend(added_lines);
                 }
             }
         }
@@ -2283,6 +2728,25 @@ fn parse_diff_added_lines_with_insertions(
     }
 
     Ok((all_lines, insertion_lines))
+}
+
+fn normalize_diff_path_token(path: &str) -> String {
+    let unescaped = crate::utils::unescape_git_path(path.trim_end());
+    let prefixes = ["a/", "b/", "c/", "w/", "i/", "o/"];
+    for prefix in prefixes {
+        if let Some(stripped) = unescaped.strip_prefix(prefix) {
+            return stripped.to_string();
+        }
+    }
+    unescaped
+}
+
+fn parse_new_file_path_from_plus_header_line(line: &str) -> Option<Option<String>> {
+    let raw = line.strip_prefix("+++ ")?;
+    if raw.trim_end() == "/dev/null" {
+        return Some(None);
+    }
+    Some(Some(normalize_diff_path_token(raw)))
 }
 
 /// Parse a hunk header line to extract added line numbers and whether it's a pure insertion
@@ -2351,6 +2815,24 @@ fn parse_hunk_header(line: &str) -> Option<(Vec<u32>, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git command should run");
+        assert!(
+            output.status.success(),
+            "git {:?} failed:\nstdout: {}\nstderr: {}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn test_parse_git_version_standard() {
@@ -2397,5 +2879,364 @@ mod tests {
         assert_eq!(parse_git_version("not a version"), None);
         assert_eq!(parse_git_version("git version"), None);
         assert_eq!(parse_git_version("git version x.y.z"), None);
+    }
+
+    #[test]
+    fn disable_internal_git_hooks_guard_applies_to_spawned_threads() {
+        let args = vec!["status".to_string()];
+        let _guard = disable_internal_git_hooks();
+
+        let spawned_args = args.clone();
+        let forwarded =
+            std::thread::spawn(move || args_with_disabled_hooks_if_needed(&spawned_args))
+                .join()
+                .expect("thread should join");
+
+        assert_eq!(forwarded[0], "-c");
+        assert!(forwarded[1].starts_with("core.hooksPath="));
+    }
+
+    #[test]
+    fn patch_profile_applies_canonical_machine_parse_flags() {
+        let args = vec!["diff".to_string(), "HEAD^".to_string(), "HEAD".to_string()];
+        let rewritten = args_with_internal_git_profile(&args, InternalGitProfile::PatchParse);
+
+        assert!(rewritten.iter().any(|arg| arg == "--no-ext-diff"));
+        assert!(rewritten.iter().any(|arg| arg == "--no-textconv"));
+        assert!(rewritten.iter().any(|arg| arg == "--src-prefix=a/"));
+        assert!(rewritten.iter().any(|arg| arg == "--dst-prefix=b/"));
+        assert!(rewritten.iter().any(|arg| arg == "--no-relative"));
+        assert!(rewritten.iter().any(|arg| arg == "--no-color"));
+        assert!(
+            rewritten
+                .iter()
+                .any(|arg| arg == "--diff-algorithm=default")
+        );
+        assert!(rewritten.iter().any(|arg| arg == "--indent-heuristic"));
+        assert!(rewritten.iter().any(|arg| arg == "--inter-hunk-context=0"));
+    }
+
+    #[test]
+    fn numstat_profile_disables_renames_and_external_renderers() {
+        let args = vec![
+            "diff".to_string(),
+            "--numstat".to_string(),
+            "HEAD^".to_string(),
+            "HEAD".to_string(),
+        ];
+        let rewritten = args_with_internal_git_profile(&args, InternalGitProfile::NumstatParse);
+        assert!(rewritten.iter().any(|arg| arg == "--no-ext-diff"));
+        assert!(rewritten.iter().any(|arg| arg == "--no-textconv"));
+        assert!(rewritten.iter().any(|arg| arg == "--no-color"));
+        assert!(rewritten.iter().any(|arg| arg == "--no-relative"));
+        assert!(rewritten.iter().any(|arg| arg == "--no-renames"));
+    }
+
+    #[test]
+    fn numstat_profile_strips_short_rename_and_copy_flags() {
+        let args = vec![
+            "diff".to_string(),
+            "--numstat".to_string(),
+            "-M90%".to_string(),
+            "-C".to_string(),
+            "-C75%".to_string(),
+            "HEAD^".to_string(),
+            "HEAD".to_string(),
+        ];
+        let rewritten = args_with_internal_git_profile(&args, InternalGitProfile::NumstatParse);
+        assert!(!rewritten.iter().any(|arg| arg == "-C"));
+        assert!(!rewritten.iter().any(|arg| arg.starts_with("-M")));
+        assert!(!rewritten.iter().any(|arg| arg.starts_with("-C")));
+        assert!(rewritten.iter().any(|arg| arg == "--no-renames"));
+    }
+
+    #[test]
+    fn general_profile_is_noop() {
+        let args = vec!["status".to_string(), "--porcelain=v2".to_string()];
+        let rewritten = args_with_internal_git_profile(&args, InternalGitProfile::General);
+        assert_eq!(rewritten, args);
+    }
+
+    #[test]
+    fn patch_profile_strips_conflicting_ext_diff_and_color_flags() {
+        let args = vec![
+            "diff".to_string(),
+            "--ext-diff".to_string(),
+            "--color=always".to_string(),
+            "HEAD".to_string(),
+        ];
+        let rewritten = args_with_internal_git_profile(&args, InternalGitProfile::PatchParse);
+
+        assert!(rewritten.iter().any(|arg| arg == "--no-ext-diff"));
+        assert!(!rewritten.iter().any(|arg| arg == "--ext-diff"));
+        assert!(!rewritten.iter().any(|arg| arg.starts_with("--color")));
+        assert!(rewritten.iter().any(|arg| arg == "--no-color"));
+    }
+
+    #[test]
+    fn patch_profile_strips_split_prefix_args() {
+        let args = vec![
+            "diff".to_string(),
+            "--src-prefix".to_string(),
+            "SRC/".to_string(),
+            "--dst-prefix".to_string(),
+            "DST/".to_string(),
+            "HEAD^".to_string(),
+            "HEAD".to_string(),
+        ];
+        let rewritten = args_with_internal_git_profile(&args, InternalGitProfile::PatchParse);
+
+        assert!(!rewritten.iter().any(|arg| arg == "--src-prefix"));
+        assert!(!rewritten.iter().any(|arg| arg == "--dst-prefix"));
+        assert!(!rewritten.iter().any(|arg| arg == "SRC/"));
+        assert!(!rewritten.iter().any(|arg| arg == "DST/"));
+        assert!(rewritten.iter().any(|arg| arg == "--src-prefix=a/"));
+        assert!(rewritten.iter().any(|arg| arg == "--dst-prefix=b/"));
+    }
+
+    #[test]
+    fn profile_rewrite_does_not_strip_pathspec_tokens_after_double_dash() {
+        let args = vec![
+            "diff".to_string(),
+            "--color=always".to_string(),
+            "HEAD^".to_string(),
+            "HEAD".to_string(),
+            "--".to_string(),
+            "--color".to_string(),
+            "--relative".to_string(),
+            "file.txt".to_string(),
+        ];
+        let rewritten = args_with_internal_git_profile(&args, InternalGitProfile::PatchParse);
+        let separator = rewritten
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("rewritten args should keep pathspec separator");
+        assert_eq!(
+            rewritten[separator + 1..],
+            [
+                "--color".to_string(),
+                "--relative".to_string(),
+                "file.txt".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_diff_profile_keeps_rename_flags_untouched() {
+        let args = vec![
+            "diff".to_string(),
+            "--raw".to_string(),
+            "-z".to_string(),
+            "-M".to_string(),
+            "HEAD^".to_string(),
+            "HEAD".to_string(),
+        ];
+        let rewritten = args_with_internal_git_profile(&args, InternalGitProfile::RawDiffParse);
+        assert!(rewritten.iter().any(|arg| arg == "-M"));
+        assert!(rewritten.iter().any(|arg| arg == "--no-ext-diff"));
+        assert!(rewritten.iter().any(|arg| arg == "--no-textconv"));
+        assert!(rewritten.iter().any(|arg| arg == "--no-color"));
+        assert!(rewritten.iter().any(|arg| arg == "--no-relative"));
+    }
+
+    #[test]
+    fn test_list_commit_files_with_utf8_filename() {
+        use crate::git::test_utils::TmpRepo;
+
+        // Create a test repo with a UTF-8 filename
+        let tmp_repo = TmpRepo::new().unwrap();
+
+        // Write a file with Chinese characters in its name
+        let chinese_filename = "中文文件.txt";
+        tmp_repo
+            .write_file(chinese_filename, "Hello, 世界!\n", false)
+            .unwrap();
+
+        // Create an initial commit (using trigger_checkpoint_with_author for human checkpoint)
+        tmp_repo
+            .trigger_checkpoint_with_author("test_user")
+            .unwrap();
+        let _authorship_log = tmp_repo.commit_with_message("Add Chinese file").unwrap();
+
+        // Now get the commit SHA using git-ai repository methods
+        let repo = tmp_repo.gitai_repo();
+        let head = repo.head().unwrap();
+        let commit_sha = head.target().unwrap();
+
+        // Test list_commit_files
+        let files = repo.list_commit_files(&commit_sha, None).unwrap();
+
+        // Debug: print what we got
+        println!("Files in commit: {:?}", files);
+
+        // The file should be in the list with its UTF-8 name
+        assert!(
+            files.contains(chinese_filename),
+            "Should contain the Chinese filename '{}', but got: {:?}",
+            chinese_filename,
+            files
+        );
+    }
+
+    #[test]
+    fn test_parse_diff_added_lines_with_insertions_standard_prefix() {
+        // Test diff with standard b/ prefix (commit-to-commit diff)
+        let diff = r#"diff --git a/test.txt b/test.txt
+index 0000000..abc1234 100644
+--- a/test.txt
++++ b/test.txt
+@@ -0,0 +1,2 @@
++line 1
++line 2"#;
+
+        let (added_lines, insertion_lines) = parse_diff_added_lines_with_insertions(diff).unwrap();
+        assert_eq!(added_lines.get("test.txt"), Some(&vec![1, 2]));
+        assert_eq!(insertion_lines.get("test.txt"), Some(&vec![1, 2]));
+    }
+
+    #[test]
+    fn test_parse_diff_added_lines_with_insertions_workdir_prefix() {
+        // Test diff with w/ prefix (commit-to-workdir diff)
+        let diff = r#"diff --git c/test.txt w/test.txt
+index a751413..8adaa6c 100644
+--- c/test.txt
++++ w/test.txt
+@@ -0,0 +1,2 @@
++// AI added line 1
++// AI added line 2"#;
+
+        let (added_lines, insertion_lines) = parse_diff_added_lines_with_insertions(diff).unwrap();
+        assert_eq!(added_lines.get("test.txt"), Some(&vec![1, 2]));
+        assert_eq!(insertion_lines.get("test.txt"), Some(&vec![1, 2]));
+    }
+
+    #[test]
+    fn test_parse_diff_added_lines_with_insertions_quoted_paths() {
+        // Test diff with quoted paths containing spaces
+        let diff = r#"diff --git "a/my file.txt" "b/my file.txt"
+index 0000000..abc1234 100644
+--- "a/my file.txt"
++++ "b/my file.txt"
+@@ -0,0 +1,3 @@
++line 1
++line 2
++line 3"#;
+
+        let (added_lines, insertion_lines) = parse_diff_added_lines_with_insertions(diff).unwrap();
+        assert_eq!(added_lines.get("my file.txt"), Some(&vec![1, 2, 3]));
+        assert_eq!(insertion_lines.get("my file.txt"), Some(&vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn test_parse_diff_added_lines_with_insertions_quoted_workdir_paths() {
+        // Test diff with quoted w/ paths
+        let diff = r#"diff --git "c/my file.txt" "w/my file.txt"
+index 0000000..abc1234 100644
+--- "c/my file.txt"
++++ "w/my file.txt"
+@@ -0,0 +1,2 @@
++line 1
++line 2"#;
+
+        let (added_lines, insertion_lines) = parse_diff_added_lines_with_insertions(diff).unwrap();
+        assert_eq!(added_lines.get("my file.txt"), Some(&vec![1, 2]));
+        assert_eq!(insertion_lines.get("my file.txt"), Some(&vec![1, 2]));
+    }
+
+    #[test]
+    fn test_parse_diff_added_lines_with_insertions_no_prefix_paths() {
+        let diff = r#"diff --git my-file.txt my-file.txt
+index 0000000..abc1234 100644
+--- my-file.txt
++++ my-file.txt
+@@ -0,0 +1,2 @@
++line 1
++line 2"#;
+
+        let (added_lines, insertion_lines) = parse_diff_added_lines_with_insertions(diff).unwrap();
+        assert_eq!(added_lines.get("my-file.txt"), Some(&vec![1, 2]));
+        assert_eq!(insertion_lines.get("my-file.txt"), Some(&vec![1, 2]));
+    }
+
+    #[test]
+    fn test_parse_diff_added_lines_with_insertions_custom_prefix_paths() {
+        let diff = r#"diff --git SRC/my-file.txt DST/my-file.txt
+index 0000000..abc1234 100644
+--- SRC/my-file.txt
++++ DST/my-file.txt
+@@ -0,0 +1,2 @@
++line 1
++line 2"#;
+
+        let (added_lines, insertion_lines) = parse_diff_added_lines_with_insertions(diff).unwrap();
+        assert_eq!(added_lines.get("DST/my-file.txt"), Some(&vec![1, 2]));
+        assert_eq!(insertion_lines.get("DST/my-file.txt"), Some(&vec![1, 2]));
+    }
+
+    #[test]
+    fn find_repository_in_path_supports_bare_repositories() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let bare = temp.path().join("repo.git");
+        fs::create_dir_all(&source).expect("create source");
+
+        run_git(&source, &["init"]);
+        run_git(&source, &["config", "user.name", "Test User"]);
+        run_git(&source, &["config", "user.email", "test@example.com"]);
+        fs::write(source.join("README.md"), "# repo\n").expect("write readme");
+        run_git(&source, &["add", "."]);
+        run_git(&source, &["commit", "-m", "initial"]);
+        run_git(
+            temp.path(),
+            &[
+                "clone",
+                "--bare",
+                source.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+
+        let repo = find_repository_in_path(bare.to_str().unwrap()).expect("find bare repo");
+        assert!(repo.is_bare_repository().expect("bare check"));
+        assert_eq!(
+            repo.path().canonicalize().expect("canonical bare"),
+            bare.canonicalize().expect("canonical path")
+        );
+    }
+
+    #[test]
+    fn find_repository_in_path_bare_repo_can_read_head_gitattributes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source");
+        let bare = temp.path().join("repo.git");
+        fs::create_dir_all(&source).expect("create source");
+
+        run_git(&source, &["init"]);
+        run_git(&source, &["config", "user.name", "Test User"]);
+        run_git(&source, &["config", "user.email", "test@example.com"]);
+        fs::write(
+            source.join(".gitattributes"),
+            "generated/** linguist-generated=true\n",
+        )
+        .expect("write attrs");
+        fs::write(source.join("README.md"), "# repo\n").expect("write readme");
+        run_git(&source, &["add", "."]);
+        run_git(&source, &["commit", "-m", "initial"]);
+        run_git(
+            temp.path(),
+            &[
+                "clone",
+                "--bare",
+                source.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+
+        let repo = find_repository_in_path(bare.to_str().unwrap()).expect("find bare repo");
+        let content = repo
+            .get_file_content(".gitattributes", "HEAD")
+            .expect("read attrs from HEAD");
+        let content = String::from_utf8(content).expect("utf8 attrs");
+        assert!(content.contains("generated/** linguist-generated=true"));
     }
 }

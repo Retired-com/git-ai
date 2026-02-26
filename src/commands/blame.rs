@@ -1,5 +1,7 @@
+use crate::auth::CredentialStore;
 use crate::authorship::authorship_log::PromptRecord;
 use crate::authorship::authorship_log_serialization::AuthorshipLog;
+use crate::authorship::prompt_utils::enrich_prompt_messages;
 use crate::authorship::working_log::CheckpointKind;
 use crate::error::GitAiError;
 use crate::git::refs::get_reference_as_authorship_log_v3;
@@ -137,6 +139,9 @@ pub struct GitAiBlameOptions {
     // Mark lines from commits without authorship logs as "Unknown"
     pub mark_unknown: bool,
 
+    // Show prompt hashes inline and dump prompts when piped
+    pub show_prompt: bool,
+
     // Split hunks when lines have different AI human authors
     // When true, a single git blame hunk may be split into multiple hunks
     // if different lines were authored by different humans working with AI
@@ -184,23 +189,22 @@ impl Default for GitAiBlameOptions {
             ignore_whitespace: false,
             json: false,
             mark_unknown: false,
+            show_prompt: false,
             split_hunks_by_ai_author: true,
         }
     }
 }
 
 impl Repository {
+    #[allow(clippy::type_complexity)]
     pub fn blame(
         &self,
         file_path: &str,
         options: &GitAiBlameOptions,
     ) -> Result<(HashMap<u32, String>, HashMap<String, PromptRecord>), GitAiError> {
         // Use repo root for file system operations
-        let repo_root = self.workdir().or_else(|e| {
-            Err(GitAiError::Generic(format!(
-                "Repository has no working directory: {}",
-                e
-            )))
+        let repo_root = self.workdir().map_err(|e| {
+            GitAiError::Generic(format!("Repository has no working directory: {}", e))
         })?;
 
         // Normalize the file path to be relative to repo root
@@ -267,6 +271,10 @@ impl Repository {
             }
             opts.use_prompt_hashes_as_names = true;
             opts
+        } else if options.show_prompt {
+            let mut opts = options.clone();
+            opts.use_prompt_hashes_as_names = true;
+            opts
         } else {
             options.clone()
         };
@@ -318,7 +326,8 @@ impl Repository {
                 )));
             }
 
-            let content = fs::read_to_string(&abs_file_path)?;
+            let raw_bytes = fs::read(&abs_file_path)?;
+            let content = String::from_utf8_lossy(&raw_bytes).into_owned();
             let lines_count = content.lines().count() as u32;
             (content, lines_count)
         };
@@ -360,6 +369,7 @@ impl Repository {
         // Output based on format
         if options.json {
             output_json_format(
+                self,
                 &line_authors,
                 &prompt_records,
                 &authorship_logs,
@@ -388,6 +398,7 @@ impl Repository {
             output_default_format(
                 self,
                 &line_authors,
+                &prompt_records,
                 &relative_file_path,
                 &lines,
                 &line_ranges,
@@ -472,7 +483,7 @@ impl Repository {
         } else {
             exec_git(&args)?
         };
-        let stdout = String::from_utf8(output.stdout)?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
 
         // Parser state for current hunk
         #[derive(Default)]
@@ -716,10 +727,7 @@ impl Repository {
             {
                 cached.clone()
             } else {
-                let authorship = match get_reference_as_authorship_log_v3(self, &hunk.commit_sha) {
-                    Ok(v3_log) => Some(v3_log),
-                    Err(_) => None, // No AI authorship data for this commit
-                };
+                let authorship = get_reference_as_authorship_log_v3(self, &hunk.commit_sha).ok();
                 commit_authorship_cache.insert(hunk.commit_sha.clone(), authorship.clone());
                 authorship
             };
@@ -739,8 +747,7 @@ impl Repository {
                             file_path,
                             orig_line_num,
                             &mut foreign_prompts_cache,
-                        )
-                    {
+                        ) {
                         prompt_record.human_author.clone()
                     } else {
                         None
@@ -801,6 +808,7 @@ impl Repository {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn overlay_ai_authorship(
     repo: &Repository,
     blame_hunks: &[BlameHunk],
@@ -831,10 +839,7 @@ fn overlay_ai_authorship(
             cached.clone()
         } else {
             // Try to get authorship log for this commit
-            let authorship = match get_reference_as_authorship_log_v3(repo, &hunk.commit_sha) {
-                Ok(v3_log) => Some(v3_log),
-                Err(_) => None, // No AI authorship data for this commit
-            };
+            let authorship = get_reference_as_authorship_log_v3(repo, &hunk.commit_sha).ok();
             commit_authorship_cache.insert(hunk.commit_sha.clone(), authorship.clone());
             authorship
         };
@@ -860,7 +865,7 @@ fn overlay_ai_authorship(
                         // Track that this prompt hash appears in this commit
                         prompt_commits
                             .entry(prompt_hash.clone())
-                            .or_insert_with(std::collections::HashSet::new)
+                            .or_default()
                             .insert(hunk.commit_sha.clone());
                         if options.use_prompt_hashes_as_names {
                             line_authors.insert(current_line_num, prompt_hash.clone());
@@ -929,11 +934,19 @@ fn overlay_ai_authorship(
     ))
 }
 
+/// Metadata about user's auth state and git identity
+#[derive(Debug, Serialize)]
+struct BlameMetadata {
+    is_logged_in: bool,
+    current_user: Option<String>,
+}
+
 /// JSON output structure for blame
 #[derive(Debug, Serialize)]
 struct JsonBlameOutput {
     lines: std::collections::BTreeMap<String, String>,
     prompts: HashMap<String, PromptRecordWithOtherFiles>,
+    metadata: BlameMetadata,
 }
 
 /// Read model that patches PromptRecord with other_files and commits fields
@@ -978,6 +991,7 @@ fn get_files_for_prompt_hash(
 }
 
 fn output_json_format(
+    repo: &Repository,
     line_authors: &HashMap<u32, String>,
     prompt_records: &HashMap<String, PromptRecord>,
     authorship_logs: &[AuthorshipLog],
@@ -1034,8 +1048,12 @@ fn output_json_format(
     // Only include prompts that are actually referenced in lines
     let referenced_prompt_ids: std::collections::HashSet<&String> = lines_map.values().collect();
 
+    // Enrich prompts that have empty messages by falling back through storage layers
+    let mut enriched_prompts = prompt_records.clone();
+    enrich_prompt_messages(&mut enriched_prompts, &referenced_prompt_ids);
+
     // Create read models with other_files and commits populated
-    let filtered_prompts: HashMap<String, PromptRecordWithOtherFiles> = prompt_records
+    let filtered_prompts: HashMap<String, PromptRecordWithOtherFiles> = enriched_prompts
         .iter()
         .filter(|(k, _)| referenced_prompt_ids.contains(k))
         .map(|(k, v)| {
@@ -1052,9 +1070,32 @@ fn output_json_format(
         })
         .collect();
 
+    // Compute metadata
+    let is_logged_in = CredentialStore::new()
+        .load()
+        .ok()
+        .flatten()
+        .map(|creds| !creds.is_refresh_token_expired())
+        .unwrap_or(false);
+
+    let current_user = {
+        let name = repo.config_get_str("user.name").ok().flatten();
+        let email = repo.config_get_str("user.email").ok().flatten();
+        match (name, email) {
+            (Some(n), Some(e)) => Some(format!("{} <{}>", n, e)),
+            (Some(n), None) => Some(n),
+            (None, Some(e)) => Some(format!("<{}>", e)),
+            (None, None) => None,
+        }
+    };
+
     let output = JsonBlameOutput {
         lines: lines_map,
         prompts: filtered_prompts,
+        metadata: BlameMetadata {
+            is_logged_in,
+            current_user,
+        },
     };
 
     let json_str = serde_json::to_string_pretty(&output)
@@ -1271,6 +1312,7 @@ fn output_incremental_format(
 fn output_default_format(
     repo: &Repository,
     line_authors: &HashMap<u32, String>,
+    prompt_records: &HashMap<String, PromptRecord>,
     file_path: &str,
     lines: &[&str],
     line_ranges: &[(u32, u32)],
@@ -1307,6 +1349,10 @@ fn output_default_format(
                 .unwrap_or(&hunk.original_author);
             let author_display = if options.suppress_author {
                 "".to_string()
+            } else if options.show_prompt && prompt_records.contains_key(author) {
+                let prompt = &prompt_records[author];
+                let short_hash = &author[..7.min(author.len())];
+                format!("{} [{}]", prompt.agent_id.tool, short_hash)
             } else if options.show_email {
                 format!("{} <{}>", author, &hunk.author_email)
             } else {
@@ -1361,6 +1407,10 @@ fn output_default_format(
                 // Handle different output formats based on flags
                 let author_display = if options.suppress_author {
                     "".to_string()
+                } else if options.show_prompt && prompt_records.contains_key(author) {
+                    let prompt = &prompt_records[author];
+                    let short_hash = &author[..7.min(author.len())];
+                    format!("{} [{}]", prompt.agent_id.tool, short_hash)
                 } else if options.show_email {
                     format!("{} <{}>", author, &hunk.author_email)
                 } else {
@@ -1447,6 +1497,39 @@ fn output_default_format(
         // Append git-like stats lines to output string
         let stats = "num read blob: 1\nnum get patch: 0\nnum commits: 0\n";
         output.push_str(stats);
+    }
+
+    // Append prompt dump for --show-prompt in non-interactive (piped) mode
+    if options.show_prompt && !io::stdout().is_terminal() {
+        let mut referenced_ids: std::collections::HashSet<&String> =
+            std::collections::HashSet::new();
+        for author in line_authors.values() {
+            if prompt_records.contains_key(author) {
+                referenced_ids.insert(author);
+            }
+        }
+
+        if !referenced_ids.is_empty() {
+            let mut enriched_prompts = prompt_records.clone();
+            enrich_prompt_messages(&mut enriched_prompts, &referenced_ids);
+
+            output.push_str("---\n");
+
+            let mut sorted_ids: Vec<&String> = referenced_ids.into_iter().collect();
+            sorted_ids.sort();
+
+            for id in sorted_ids {
+                let short_hash = &id[..7.min(id.len())];
+                output.push_str(&format!("Prompt [{}]\n", short_hash));
+                if let Some(prompt) = enriched_prompts.get(id) {
+                    let json = serde_json::to_string(&prompt.messages)
+                        .unwrap_or_else(|_| "[]".to_string());
+                    output.push_str(&json);
+                    output.push('\n');
+                }
+                output.push('\n');
+            }
+        }
     }
 
     // Output handling - respect pager environment variables
@@ -1758,13 +1841,10 @@ pub fn parse_blame_args(args: &[String]) -> Result<(String, GitAiBlameOptions), 
                         "Missing argument for --since".to_string(),
                     ));
                 }
-                options.oldest_date = Some(
-                    DateTime::parse_from_rfc3339(&args[i + 1])
-                        .map_err(|e| {
-                            GitAiError::Generic(format!("Invalid date format for --since: {}", e))
-                        })?
-                        .into(),
-                );
+                options.oldest_date =
+                    Some(DateTime::parse_from_rfc3339(&args[i + 1]).map_err(|e| {
+                        GitAiError::Generic(format!("Invalid date format for --since: {}", e))
+                    })?);
                 i += 2;
             }
             // JSON output format
@@ -1776,6 +1856,12 @@ pub fn parse_blame_args(args: &[String]) -> Result<(String, GitAiBlameOptions), 
             // Mark unknown authorship
             "--mark-unknown" => {
                 options.mark_unknown = true;
+                i += 1;
+            }
+
+            // Show prompt hashes inline
+            "--show-prompt" => {
+                options.show_prompt = true;
                 i += 1;
             }
 

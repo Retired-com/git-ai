@@ -1,7 +1,7 @@
 use crate::authorship::authorship_log::{LineRange, PromptRecord};
 use crate::commands::blame::GitAiBlameOptions;
 use crate::error::GitAiError;
-use crate::git::repository::{Repository, exec_git};
+use crate::git::repository::{InternalGitProfile, Repository, exec_git_with_profile};
 use serde::{Deserialize, Serialize, Serializer};
 use std::collections::{BTreeMap, HashMap};
 use std::io::IsTerminal;
@@ -22,6 +22,7 @@ pub enum DiffFormat {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct DiffHunk {
     pub file_path: String,
     pub old_start: u32,
@@ -180,7 +181,7 @@ fn resolve_commit(repo: &Repository, rev: &str) -> Result<String, GitAiError> {
     args.push("rev-parse".to_string());
     args.push(rev.to_string());
 
-    let output = exec_git(&args)?;
+    let output = exec_git_with_profile(&args, InternalGitProfile::General)?;
     let sha = String::from_utf8(output.stdout)
         .map_err(|e| GitAiError::Generic(format!("Failed to parse rev-parse output: {}", e)))?
         .trim()
@@ -204,7 +205,7 @@ fn resolve_parent(repo: &Repository, commit: &str) -> Result<String, GitAiError>
     args.push("rev-parse".to_string());
     args.push(parent_rev);
 
-    let output = exec_git(&args);
+    let output = exec_git_with_profile(&args, InternalGitProfile::General);
 
     match output {
         Ok(out) => {
@@ -240,10 +241,11 @@ pub fn get_diff_with_line_numbers(
     args.push("diff".to_string());
     args.push("-U0".to_string()); // No context lines, just changes
     args.push("--no-color".to_string());
+    args.push("--no-renames".to_string());
     args.push(from.to_string());
     args.push(to.to_string());
 
-    let output = exec_git(&args)?;
+    let output = exec_git_with_profile(&args, InternalGitProfile::PatchParse)?;
     let diff_text = String::from_utf8(output.stdout)
         .map_err(|e| GitAiError::Generic(format!("Failed to parse diff output: {}", e)))?;
 
@@ -255,9 +257,8 @@ fn parse_diff_hunks(diff_text: &str) -> Result<Vec<DiffHunk>, GitAiError> {
     let mut current_file = String::new();
 
     for line in diff_text.lines() {
-        if line.starts_with("+++ b/") {
-            // New file path
-            current_file = line[6..].to_string();
+        if let Some(path_opt) = parse_new_file_path_from_plus_header_line(line) {
+            current_file = path_opt.unwrap_or_default();
         } else if line.starts_with("@@ ") {
             // Hunk header
             if let Some(hunk) = parse_hunk_line(line, &current_file)? {
@@ -267,6 +268,25 @@ fn parse_diff_hunks(diff_text: &str) -> Result<Vec<DiffHunk>, GitAiError> {
     }
 
     Ok(hunks)
+}
+
+fn normalize_diff_path_token(path: &str) -> String {
+    let unescaped = crate::utils::unescape_git_path(path.trim_end());
+    let prefixes = ["a/", "b/", "c/", "w/", "i/", "o/"];
+    for prefix in prefixes {
+        if let Some(stripped) = unescaped.strip_prefix(prefix) {
+            return stripped.to_string();
+        }
+    }
+    unescaped
+}
+
+fn parse_new_file_path_from_plus_header_line(line: &str) -> Option<Option<String>> {
+    let raw = line.strip_prefix("+++ ")?;
+    if raw.trim_end() == "/dev/null" {
+        return Some(None);
+    }
+    Some(Some(normalize_diff_path_token(raw)))
 }
 
 fn parse_hunk_line(line: &str, file_path: &str) -> Result<Option<DiffHunk>, GitAiError> {
@@ -283,8 +303,7 @@ fn parse_hunk_line(line: &str, file_path: &str) -> Result<Option<DiffHunk>, GitA
     let new_part = parts[2]; // e.g., "+15,5" or "+15"
 
     // Parse old part
-    let (old_start, old_count) = if old_part.starts_with('-') {
-        let old_str = &old_part[1..];
+    let (old_start, old_count) = if let Some(old_str) = old_part.strip_prefix('-') {
         if let Some((start_str, count_str)) = old_str.split_once(',') {
             let start: u32 = start_str.parse().unwrap_or(0);
             let count: u32 = count_str.parse().unwrap_or(0);
@@ -298,8 +317,7 @@ fn parse_hunk_line(line: &str, file_path: &str) -> Result<Option<DiffHunk>, GitA
     };
 
     // Parse new part
-    let (new_start, new_count) = if new_part.starts_with('+') {
-        let new_str = &new_part[1..];
+    let (new_start, new_count) = if let Some(new_str) = new_part.strip_prefix('+') {
         if let Some((start_str, count_str)) = new_str.split_once(',') {
             let start: u32 = start_str.parse().unwrap_or(0);
             let count: u32 = count_str.parse().unwrap_or(0);
@@ -354,7 +372,7 @@ pub fn overlay_diff_attributions(
         if !hunk.added_lines.is_empty() {
             lines_by_file
                 .entry(hunk.file_path.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .extend(&hunk.added_lines);
         }
     }
@@ -372,10 +390,13 @@ pub fn overlay_diff_attributions(
 
         // Build blame options
         let mut options = GitAiBlameOptions::default();
-        options.oldest_commit = Some(from_commit.to_string());
-        options.newest_commit = Some(to_commit.to_string());
-        options.line_ranges = line_ranges;
-        options.no_output = true;
+        #[allow(clippy::field_reassign_with_default)]
+        {
+            options.oldest_commit = Some(from_commit.to_string());
+            options.newest_commit = Some(to_commit.to_string());
+            options.line_ranges = line_ranges;
+            options.no_output = true;
+        }
 
         // Call blame to get attributions
         let blame_result = repo.blame(&file_path, &options);
@@ -468,7 +489,7 @@ fn build_diff_json(
     from_commit: &str,
     to_commit: &str,
     hunks: &[DiffHunk],
-    attributions: &HashMap<DiffLineKey, Attribution>,
+    _attributions: &HashMap<DiffLineKey, Attribution>,
 ) -> Result<DiffJson, GitAiError> {
     let mut files: BTreeMap<String, FileDiffJson> = BTreeMap::new();
     let mut all_prompts: BTreeMap<String, PromptRecord> = BTreeMap::new();
@@ -526,10 +547,11 @@ fn get_diff_split_by_file(
     let mut args = repo.global_args_for_exec();
     args.push("diff".to_string());
     args.push("--no-color".to_string());
+    args.push("--no-renames".to_string());
     args.push(from_commit.to_string());
     args.push(to_commit.to_string());
 
-    let output = exec_git(&args)?;
+    let output = exec_git_with_profile(&args, InternalGitProfile::PatchParse)?;
     let diff_text = String::from_utf8(output.stdout)
         .map_err(|e| GitAiError::Generic(format!("Failed to parse diff output: {}", e)))?;
 
@@ -545,8 +567,8 @@ fn get_diff_split_by_file(
             }
             current_diff = format!("{}\n", line);
             current_file.clear();
-        } else if line.starts_with("+++ b/") {
-            current_file = line[6..].to_string();
+        } else if let Some(path_opt) = parse_new_file_path_from_plus_header_line(line) {
+            current_file = path_opt.unwrap_or_default();
             current_diff.push_str(line);
             current_diff.push('\n');
         } else {
@@ -564,6 +586,7 @@ fn get_diff_split_by_file(
 }
 
 /// Collect annotations for a specific file, returning (annotations_map, prompt_records_map)
+#[allow(clippy::type_complexity)]
 fn collect_file_annotations(
     repo: &Repository,
     from_commit: &str,
@@ -602,11 +625,14 @@ fn collect_file_annotations(
 
     // Build blame options - use prompt hashes as names to get the actual hash per line
     let mut options = GitAiBlameOptions::default();
-    options.oldest_commit = Some(from_commit.to_string());
-    options.newest_commit = Some(to_commit.to_string());
-    options.line_ranges = line_ranges;
-    options.no_output = true;
-    options.use_prompt_hashes_as_names = true; // Key: get prompt hash instead of tool name
+    #[allow(clippy::field_reassign_with_default)]
+    {
+        options.oldest_commit = Some(from_commit.to_string());
+        options.newest_commit = Some(to_commit.to_string());
+        options.line_ranges = line_ranges;
+        options.no_output = true;
+        options.use_prompt_hashes_as_names = true; // Key: get prompt hash instead of tool name
+    }
 
     // Call blame to get attributions
     let blame_result = repo.blame(file_path, &options);
@@ -623,7 +649,7 @@ fn collect_file_annotations(
                     if blame_prompt_records.contains_key(prompt_hash) {
                         lines_by_hash
                             .entry(prompt_hash.clone())
-                            .or_insert_with(Vec::new)
+                            .or_default()
                             .push(line);
                     }
                 }
@@ -652,6 +678,7 @@ fn collect_file_annotations(
 // Output Formatting
 // ============================================================================
 
+#[allow(clippy::if_same_then_else)]
 pub fn format_annotated_diff(
     repo: &Repository,
     from_commit: &str,
@@ -662,10 +689,11 @@ pub fn format_annotated_diff(
     let mut args = repo.global_args_for_exec();
     args.push("diff".to_string());
     args.push("--no-color".to_string());
+    args.push("--no-renames".to_string());
     args.push(from_commit.to_string());
     args.push(to_commit.to_string());
 
-    let output = exec_git(&args)?;
+    let output = exec_git_with_profile(&args, InternalGitProfile::PatchParse)?;
     let diff_text = String::from_utf8(output.stdout)
         .map_err(|e| GitAiError::Generic(format!("Failed to parse diff output: {}", e)))?;
 
@@ -689,8 +717,8 @@ pub fn format_annotated_diff(
             result.push_str(&format_line(line, LineType::DiffHeader, use_color, None));
         } else if line.starts_with("--- ") {
             result.push_str(&format_line(line, LineType::DiffHeader, use_color, None));
-        } else if line.starts_with("+++ b/") {
-            current_file = line[6..].to_string();
+        } else if let Some(path_opt) = parse_new_file_path_from_plus_header_line(line) {
+            current_file = path_opt.unwrap_or_default();
             result.push_str(&format_line(line, LineType::DiffHeader, use_color, None));
         } else if line.starts_with("@@ ") {
             // Hunk header - update line counters
@@ -757,8 +785,7 @@ fn parse_hunk_header_for_line_nums(line: &str) -> Option<(u32, u32)> {
     let new_part = parts[2];
 
     // Extract old_start
-    let old_start = if old_part.starts_with('-') {
-        let old_str = &old_part[1..];
+    let old_start = if let Some(old_str) = old_part.strip_prefix('-') {
         if let Some((start_str, _)) = old_str.split_once(',') {
             start_str.parse::<u32>().ok()?
         } else {
@@ -769,8 +796,7 @@ fn parse_hunk_header_for_line_nums(line: &str) -> Option<(u32, u32)> {
     };
 
     // Extract new_start
-    let new_start = if new_part.starts_with('+') {
-        let new_str = &new_part[1..];
+    let new_start = if let Some(new_str) = new_part.strip_prefix('+') {
         if let Some((start_str, _)) = new_str.split_once(',') {
             start_str.parse::<u32>().ok()?
         } else {
@@ -880,20 +906,12 @@ where
 // ============================================================================
 
 /// Options for getting a diff with optional filtering
+#[derive(Default)]
 pub struct DiffOptions {
     /// If provided, only include files with attributions from these prompts
     pub prompt_ids: Option<Vec<String>>,
     /// Whether to filter files to only those with attributions from prompt_ids
     pub filter_to_attributed_files: bool,
-}
-
-impl Default for DiffOptions {
-    fn default() -> Self {
-        Self {
-            prompt_ids: None,
-            filter_to_attributed_files: false,
-        }
-    }
 }
 
 /// Get diff JSON for a single commit with optional filtering by prompt attributions
@@ -921,22 +939,27 @@ pub fn get_diff_json_filtered(
     let mut diff_json = build_diff_json(repo, &from_commit, &to_commit, &hunks, &attributions)?;
 
     // Apply filtering if requested
-    if options.filter_to_attributed_files {
-        if let Some(ref prompt_ids) = options.prompt_ids {
-            let prompt_id_set: std::collections::HashSet<&String> = prompt_ids.iter().collect();
+    if options.filter_to_attributed_files
+        && let Some(ref prompt_ids) = options.prompt_ids
+    {
+        let prompt_id_set: std::collections::HashSet<&String> = prompt_ids.iter().collect();
 
-            // Filter files to only those with attributions from the specified prompts
-            diff_json.files.retain(|_file_path, file_diff| {
-                // Check if any annotation key matches a prompt_id
-                file_diff.annotations.keys().any(|key| prompt_id_set.contains(key))
-            });
-        }
+        // Filter files to only those with attributions from the specified prompts
+        diff_json.files.retain(|_file_path, file_diff| {
+            // Check if any annotation key matches a prompt_id
+            file_diff
+                .annotations
+                .keys()
+                .any(|key| prompt_id_set.contains(key))
+        });
     }
 
     // Filter prompts to only those specified (if any)
     if let Some(ref prompt_ids) = options.prompt_ids {
         let prompt_id_set: std::collections::HashSet<&String> = prompt_ids.iter().collect();
-        diff_json.prompts.retain(|key, _| prompt_id_set.contains(key));
+        diff_json
+            .prompts
+            .retain(|key, _| prompt_id_set.contains(key));
     }
 
     Ok(diff_json)
@@ -948,8 +971,6 @@ pub fn get_diff_json_filtered(
 
 #[cfg(test)]
 mod tests {
-    use crate::git::find_repository_in_path;
-
     use super::*;
 
     #[test]
@@ -1162,5 +1183,35 @@ index 111222..333444 100644
         let diff_text = "";
         let result = parse_diff_hunks(diff_text).unwrap();
         assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_diff_hunks_no_prefix_paths() {
+        let diff_text = r#"diff --git file1.rs file1.rs
+index abc123..def456 100644
+--- file1.rs
++++ file1.rs
+@@ -1,0 +1,1 @@
++fn added() {}
+"#;
+
+        let result = parse_diff_hunks(diff_text).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].file_path, "file1.rs");
+    }
+
+    #[test]
+    fn test_parse_diff_hunks_custom_prefix_paths() {
+        let diff_text = r#"diff --git SRC/file1.rs DST/file1.rs
+index abc123..def456 100644
+--- SRC/file1.rs
++++ DST/file1.rs
+@@ -1,0 +1,1 @@
++fn added() {}
+"#;
+
+        let result = parse_diff_hunks(diff_text).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].file_path, "DST/file1.rs");
     }
 }

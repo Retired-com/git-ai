@@ -10,8 +10,8 @@ YELLOW='\033[0;33m'
 NC='\033[0m' # No Color
 
 # GitHub repository details
-# Replaced during release builds with the actual repository (e.g., "acunniffe/git-ai")
-# When set to __REPO_PLACEHOLDER__, defaults to "acunniffe/git-ai"
+# Replaced during release builds with the actual repository (e.g., "git-ai-project/git-ai")
+# When set to __REPO_PLACEHOLDER__, defaults to "git-ai-project/git-ai"
 REPO="__REPO_PLACEHOLDER__"
 if [ "$REPO" = "__REPO_PLACEHOLDER__" ]; then
     REPO="Retired-com/git-ai"
@@ -90,24 +90,24 @@ verify_checksum() {
 # Returns shell configurations in format: "shell_name|config_file" (one per line)
 detect_all_shells() {
     local shells=""
-
+    
     # Check for bash configs (prefer .bashrc over .bash_profile)
     if [ -f "$HOME/.bashrc" ]; then
         shells="${shells}bash|$HOME/.bashrc\n"
     elif [ -f "$HOME/.bash_profile" ]; then
         shells="${shells}bash|$HOME/.bash_profile\n"
     fi
-
+    
     # Check for zsh config
     if [ -f "$HOME/.zshrc" ]; then
         shells="${shells}zsh|$HOME/.zshrc\n"
     fi
-
+    
     # Check for fish config
     if [ -f "$HOME/.config/fish/config.fish" ]; then
         shells="${shells}fish|$HOME/.config/fish/config.fish\n"
     fi
-
+    
     # If no configs found, fall back to $SHELL detection and create config for that shell only
     if [ -z "$shells" ]; then
         local login_shell=""
@@ -126,7 +126,7 @@ detect_all_shells() {
                 ;;
         esac
     fi
-
+    
     # Remove trailing newline and output
     printf '%b' "$shells" | sed '/^$/d'
 }
@@ -168,12 +168,12 @@ detect_std_git() {
 
     # Fail if we couldn't find a standard git
     if [ -z "$git_path" ]; then
-        error "Could not detect a standard git binary on PATH. Please ensure you have Git installed and available on your PATH. If you believe this is a bug with the installer, please file an issue at https://github.com/acunniffe/git-ai/issues."
+        error "Could not detect a standard git binary on PATH. Please ensure you have Git installed and available on your PATH. If you believe this is a bug with the installer, please file an issue at https://github.com/git-ai-project/git-ai/issues."
     fi
 
     # Verify detected git is usable
     if ! "$git_path" --version >/dev/null 2>&1; then
-        error "Detected git at $git_path is not usable (--version failed). Please ensure you have Git installed and available on your PATH. If you believe this is a bug with the installer, please file an issue at https://github.com/acunniffe/git-ai/issues."
+        error "Detected git at $git_path is not usable (--version failed). Please ensure you have Git installed and available on your PATH. If you believe this is a bug with the installer, please file an issue at https://github.com/git-ai-project/git-ai/issues."
     fi
 
     echo "$git_path"
@@ -216,8 +216,11 @@ esac
 BINARY_NAME="git-ai-${OS}-${ARCH}"
 
 # Determine release tag
-# Priority: 1. Pinned version (for release builds), 2. Environment variable, 3. "latest"
-if [ "$PINNED_VERSION" != "__VERSION_PLACEHOLDER__" ]; then
+# Priority: 1. Local binary override, 2. Pinned version (for release builds), 3. Environment variable, 4. "latest"
+if [ -n "${GIT_AI_LOCAL_BINARY:-}" ]; then
+    RELEASE_TAG="local"
+    DOWNLOAD_URL=""
+elif [ "$PINNED_VERSION" != "__VERSION_PLACEHOLDER__" ]; then
     # Version-pinned install script from a release
     RELEASE_TAG="$PINNED_VERSION"
     DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/${BINARY_NAME}"
@@ -238,11 +241,19 @@ INSTALL_DIR="$HOME/.git-ai/bin"
 mkdir -p "$INSTALL_DIR"
 
 # Download and install
-echo "Downloading git-ai (release: ${RELEASE_TAG})..."
 TMP_FILE="${INSTALL_DIR}/git-ai.tmp.$$"
-if ! curl --fail --location --silent --show-error -o "$TMP_FILE" "$DOWNLOAD_URL"; then
-    rm -f "$TMP_FILE" 2>/dev/null || true
-    error "Failed to download binary (HTTP error)"
+if [ -n "${GIT_AI_LOCAL_BINARY:-}" ]; then
+    echo "Using local git-ai binary (release: ${RELEASE_TAG})..."
+    if [ ! -f "$GIT_AI_LOCAL_BINARY" ]; then
+        error "Local binary not found at $GIT_AI_LOCAL_BINARY"
+    fi
+    cp "$GIT_AI_LOCAL_BINARY" "$TMP_FILE"
+else
+    echo "Downloading git-ai (release: ${RELEASE_TAG})..."
+    if ! curl --fail --location --silent --show-error -o "$TMP_FILE" "$DOWNLOAD_URL"; then
+        rm -f "$TMP_FILE" 2>/dev/null || true
+        error "Failed to download binary (HTTP error)"
+    fi
 fi
 
 # Basic validation: ensure file is not empty
@@ -276,7 +287,14 @@ success "You can now run 'git-ai' from your terminal"
 INSTALLED_VERSION=$(${INSTALL_DIR}/git-ai --version 2>&1 || echo "unknown")
 echo "Installed git-ai ${INSTALLED_VERSION}"
 
-# Install hooks
+# Login user with install token if provided
+NEED_LOGIN=false
+if [ -n "${INSTALL_NONCE:-}" ] && [ -n "${API_BASE:-}" ]; then
+    if ! ${INSTALL_DIR}/git-ai exchange-nonce; then
+        NEED_LOGIN=true
+    fi
+fi
+
 echo "Setting up IDE/agent hooks..."
 if ! ${INSTALL_DIR}/git-ai install-hooks; then
     warn "Warning: Failed to set up IDE/agent hooks. Please try running 'git-ai install-hooks' manually."
@@ -305,7 +323,7 @@ SHELLS_ALREADY_CONFIGURED=""
 
 while IFS='|' read -r shell_name config_file; do
     [ -z "$shell_name" ] && continue
-
+    
     # Generate shell-appropriate PATH command
     if [ "$shell_name" = "fish" ]; then
         path_cmd="fish_add_path -g \"$INSTALL_DIR\""
@@ -314,10 +332,10 @@ while IFS='|' read -r shell_name config_file; do
     else
         path_cmd="export PATH=\"$INSTALL_DIR:\$PATH\""
     fi
-
+    
     # Create config file if it doesn't exist (for fallback case when no configs found)
     touch "$config_file"
-
+    
     # Append if not already present
     if ! grep -qsF "$INSTALL_DIR" "$config_file"; then
         echo "" >> "$config_file"
@@ -337,7 +355,7 @@ if [ -n "$SHELLS_CONFIGURED" ]; then
         [ -z "$shell_name" ] && continue
         success "  ✓ $config_file"
     done
-
+    
     echo ""
     echo "To apply changes immediately:"
     printf '%b' "$SHELLS_CONFIGURED" | while IFS='|' read -r shell_name config_file; do
@@ -368,3 +386,10 @@ fi
 
 echo ""
 echo -e "${YELLOW}Close and reopen your terminal and IDE sessions to use git-ai.${NC}"
+
+# If nonce exchange failed, run interactive login
+if [ "$NEED_LOGIN" = true ]; then
+    echo ""
+    echo "Launching login..."
+    ${INSTALL_DIR}/git-ai login
+fi

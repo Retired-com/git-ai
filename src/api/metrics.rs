@@ -28,10 +28,13 @@ pub struct MetricsUploadResponse {
 
 impl MetricsUploadResponse {
     /// Get indices of successfully uploaded events
+    #[allow(dead_code)]
     pub fn successful_indices(&self, batch_size: usize) -> Vec<usize> {
         let error_indices: std::collections::HashSet<_> =
             self.errors.iter().map(|e| e.index).collect();
-        (0..batch_size).filter(|i| !error_indices.contains(i)).collect()
+        (0..batch_size)
+            .filter(|i| !error_indices.contains(i))
+            .collect()
     }
 }
 
@@ -53,6 +56,12 @@ pub fn upload_metrics_with_retry(
         .enumerate()
     {
         if attempt > 0 {
+            eprintln!(
+                "[metrics] Retrying upload after {}s delay (attempt {}/{})",
+                delay_secs,
+                attempt + 1,
+                RETRY_DELAYS_SECS.len() + 1
+            );
             std::thread::sleep(std::time::Duration::from_secs(*delay_secs));
         }
 
@@ -76,13 +85,17 @@ pub fn upload_metrics_with_retry(
             Err(e) => {
                 // Non-200 - will retry if attempts remain
                 if attempt == RETRY_DELAYS_SECS.len() {
+                    eprintln!("[metrics] All retries exhausted, giving up");
                     return Err(e);
                 }
+                eprintln!("[metrics] Upload failed: {}, will retry...", e);
             }
         }
     }
 
-    Err(GitAiError::Generic("All upload retries exhausted".to_string()))
+    Err(GitAiError::Generic(
+        "All upload retries exhausted".to_string(),
+    ))
 }
 
 /// Metrics API endpoints
@@ -95,7 +108,10 @@ impl ApiClient {
     /// # Returns
     /// * `Ok(MetricsUploadResponse)` - Response with errors (empty = all success)
     /// * `Err(GitAiError)` - Request failed
-    pub fn upload_metrics(&self, batch: &MetricsBatch) -> Result<MetricsUploadResponse, GitAiError> {
+    pub fn upload_metrics(
+        &self,
+        batch: &MetricsBatch,
+    ) -> Result<MetricsUploadResponse, GitAiError> {
         let response = self.context().post_json("/worker/metrics/upload", batch)?;
         let status_code = response.status_code;
 
@@ -106,7 +122,7 @@ impl ApiClient {
         match status_code {
             200 => {
                 let metrics_response: MetricsUploadResponse =
-                    serde_json::from_str(body).map_err(|e| GitAiError::JsonError(e))?;
+                    serde_json::from_str(body).map_err(GitAiError::JsonError)?;
                 Ok(metrics_response)
             }
             400 => {
@@ -148,8 +164,14 @@ mod tests {
     fn test_successful_indices() {
         let response = MetricsUploadResponse {
             errors: vec![
-                MetricsUploadError { index: 1, error: "error".to_string() },
-                MetricsUploadError { index: 3, error: "error".to_string() },
+                MetricsUploadError {
+                    index: 1,
+                    error: "error".to_string(),
+                },
+                MetricsUploadError {
+                    index: 3,
+                    error: "error".to_string(),
+                },
             ],
         };
 
@@ -168,8 +190,14 @@ mod tests {
     fn test_successful_indices_all_errors() {
         let response = MetricsUploadResponse {
             errors: vec![
-                MetricsUploadError { index: 0, error: "error".to_string() },
-                MetricsUploadError { index: 1, error: "error".to_string() },
+                MetricsUploadError {
+                    index: 0,
+                    error: "error".to_string(),
+                },
+                MetricsUploadError {
+                    index: 1,
+                    error: "error".to_string(),
+                },
             ],
         };
         let successful = response.successful_indices(2);

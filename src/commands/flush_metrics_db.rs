@@ -2,25 +2,28 @@
 //!
 //! Drains the metrics database queue by uploading batches to the API.
 
-use crate::api::{upload_metrics_with_retry, ApiClient, ApiContext};
+use crate::api::{ApiClient, ApiContext, upload_metrics_with_retry};
 use crate::metrics::db::MetricsDatabase;
 use crate::metrics::{MetricEvent, MetricsBatch};
 
 /// Max events per batch upload
 const MAX_BATCH_SIZE: usize = 250;
+const ENV_FLUSH_METRICS_DB_WORKER: &str = "GIT_AI_FLUSH_METRICS_DB_WORKER";
 
 /// Spawn a background process to flush metrics DB
+#[cfg(not(any(test, feature = "test-support")))]
 pub fn spawn_background_metrics_db_flush() {
-    use std::process::Command;
-
-    if let Ok(exe) = crate::utils::current_git_ai_exe() {
-        let _ = Command::new(exe)
-            .arg("flush-metrics-db")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
+    let _ = crate::utils::spawn_internal_git_ai_subcommand(
+        "flush-metrics-db",
+        &[],
+        ENV_FLUSH_METRICS_DB_WORKER,
+        &[],
+    );
 }
+
+/// No-op in test mode.
+#[cfg(any(test, feature = "test-support"))]
+pub fn spawn_background_metrics_db_flush() {}
 
 /// Handle the flush-metrics-db command
 pub fn handle_flush_metrics_db(_args: &[String]) {

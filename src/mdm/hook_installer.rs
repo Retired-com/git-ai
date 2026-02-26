@@ -15,6 +15,7 @@ pub struct HookCheckResult {
     /// Whether hooks are installed
     pub hooks_installed: bool,
     /// Whether hooks are up to date
+    #[allow(dead_code)]
     pub hooks_up_to_date: bool,
 }
 
@@ -45,6 +46,12 @@ pub trait HookInstaller: Send + Sync {
 
     /// Short identifier for status maps (e.g., "claude-code", "cursor")
     fn id(&self) -> &str;
+
+    /// Whether this tool uses config file hooks (vs only extras like plugins)
+    /// Default is true. Tools that only use install_extras should return false.
+    fn uses_config_hooks(&self) -> bool {
+        true
+    }
 
     /// Check if the tool is installed and hook status
     fn check_hooks(&self, params: &HookInstallerParams) -> Result<HookCheckResult, GitAiError>;
